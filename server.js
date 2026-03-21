@@ -21,14 +21,33 @@ const PORT    = process.env.PORT || 4000
 const TMP_DIR = process.env.TMP_DIR || path.join(__dirname, 'tmp')
 
 // CORS: allow your Cloudflare Pages domain + localhost dev
+// ── CORS config ─────────────────────────────────────────────────
+// Allowed origins: localhost + Cloudflare Pages + custom domains
 const ALLOWED_ORIGINS = [
+  // Local dev
   'http://localhost:5173',
   'http://localhost:5174',
   'http://localhost:4173',
-  // Add your Cloudflare Pages domain:
-  process.env.FRONTEND_URL,       // e.g. https://snapload.pages.dev
-  process.env.FRONTEND_URL_CUSTOM, // e.g. https://snapload.app
+  'http://localhost:3000',
+  // Production — your actual Cloudflare Pages domain
+  'https://mytools-9ns.pages.dev',
+  // Add more domains here if needed:
+  // 'https://yourdomain.com',
+  // From env vars (Railway/Render environment variables)
+  process.env.FRONTEND_URL,
+  process.env.FRONTEND_URL_CUSTOM,
 ].filter(Boolean)
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true  // allow curl, Postman, mobile apps
+  if (ALLOWED_ORIGINS.includes(origin)) return true
+  // Allow all Cloudflare Pages preview deployments: *.pages.dev
+  if (origin.endsWith('.pages.dev')) return true
+  // Allow all Railway/Render preview deployments
+  if (origin.endsWith('.up.railway.app')) return true
+  if (origin.endsWith('.onrender.com')) return true
+  return false
+}
 
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true })
 
@@ -37,17 +56,20 @@ const app = express()
 
 app.use(cors({
   origin: (origin, cb) => {
-    // Allow requests with no origin (curl, mobile apps)
-    // OR from allowed origins
-    if (!origin || ALLOWED_ORIGINS.includes(origin) || ALLOWED_ORIGINS.length === 0) {
+    if (isAllowedOrigin(origin)) {
       cb(null, true)
     } else {
+      console.warn(`CORS blocked: ${origin}`)
       cb(new Error(`CORS blocked: ${origin}`))
     }
   },
-  methods: ['GET', 'POST'],
-  allowedHeaders: ['Content-Type'],
+  methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
 }))
+
+// Handle preflight OPTIONS requests
+app.options('*', cors())
 
 app.use(express.json({ limit: '10mb' }))
 
