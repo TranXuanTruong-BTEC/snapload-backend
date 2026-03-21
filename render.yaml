@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: snapload-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: PORT
+        value: 4000
+    healthCheckPath: /api/health
