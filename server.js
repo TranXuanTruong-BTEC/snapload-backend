@@ -26,13 +26,37 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PORT    = process.env.PORT || 4000
 const TMP_DIR = process.env.TMP_DIR || path.join(__dirname, 'tmp')
 const LOG_DIR = path.join(__dirname, 'logs')
+const DB_FILE = path.join(LOG_DIR, 'data.json')  // lightweight JSON store
 
-// ── Security Logger ─────────────────────────────────────────
+// ── In-memory DB (persisted to data.json) ────────────────────
+let _db = { blockedIPs: [], feedback: [] }
+
+function loadDB() {
+  try {
+    if (fs.existsSync(DB_FILE)) _db = JSON.parse(fs.readFileSync(DB_FILE, 'utf-8'))
+    if (!_db.blockedIPs) _db.blockedIPs = []
+    if (!_db.feedback)   _db.feedback   = []
+  } catch { _db = { blockedIPs: [], feedback: [] } }
+}
+
+function saveDB() {
+  try { fs.writeFileSync(DB_FILE, JSON.stringify(_db, null, 2)) } catch {}
+}
+
+// Visitor log (in-memory only, reset on restart)
+const visitors = []  // [{ ts, ip, path, ua, country }]
+const MAX_VISITORS = 5000
+
+// ── Init storage ─────────────────────────────────────────────
 try {
   if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true })
+  if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true })
 } catch (e) {
-  console.warn('Could not create logs dir:', e.message)
+  console.warn('Could not create dirs:', e.message)
 }
+loadDB()
+
+// ── Security Logger ─────────────────────────────────────────
 
 const _logStream = (() => {
   try {
@@ -148,6 +172,34 @@ function checkRateLimit(ip, endpoint, max) {
   }
   return cnt > max
 }
+
+// ── IP Block middleware ───────────────────────────────────────
+app.use((req, res, next) => {
+  const ip = req.ip || req.connection.remoteAddress || 'unknown'
+  if (_db.blockedIPs.includes(ip)) {
+    secLog('WARN', 'BLOCKED_IP', { ip, path: req.path })
+    return res.status(403).json({ error: 'Access denied' })
+  }
+  next()
+})
+
+// ── Visitor tracking middleware ───────────────────────────────
+app.use((req, res, next) => {
+  // Only track meaningful endpoints, skip static/health spam
+  const track = ['/api/info', '/api/download', '/api/convert', '/api/health']
+  if (track.some(p => req.path.startsWith(p))) {
+    const entry = {
+      ts:   new Date().toISOString(),
+      ip:   req.ip || 'unknown',
+      path: req.path,
+      ua:   (req.headers['user-agent'] || '').slice(0, 120),
+      ref:  (req.headers['referer']    || '').slice(0, 80),
+    }
+    visitors.push(entry)
+    if (visitors.length > MAX_VISITORS) visitors.splice(0, visitors.length - MAX_VISITORS)
+  }
+  next()
+})
 
 app.use((req, res, next) => {
   const ip  = req.ip || 'unknown'
@@ -552,6 +604,108 @@ app.get('/api/download-converted/:filename', (req, res) => {
   stream.on('end', () => setTimeout(() => deleteFiles(filePath), 10000))
 })
 
+// ── GET /api/visitors — visitor stats ────────────────────────
+app.get('/api/visitors', requireAdminToken, (req, res) => {
+  const limit = parseInt(req.query.limit || '200')
+  const recent = [...visitors].reverse().slice(0, limit)
+
+  // Stats
+  const ipCounts = {}
+  const pathCounts = {}
+  const hourly = Array.from({length:24}, (_,h) => ({h, count:0}))
+  const last24h = Date.now() - 86400000
+
+  visitors.forEach(v => {
+    ipCounts[v.ip]     = (ipCounts[v.ip]     || 0) + 1
+    pathCounts[v.path] = (pathCounts[v.path] || 0) + 1
+    if (new Date(v.ts).getTime() > last24h) {
+      const h = new Date(v.ts).getHours()
+      hourly[h].count++
+    }
+  })
+
+  const topIPs = Object.entries(ipCounts)
+    .sort((a,b) => b[1]-a[1]).slice(0,20)
+    .map(([ip,count]) => ({ ip, count, blocked: _db.blockedIPs.includes(ip) }))
+
+  res.json({
+    ok: true,
+    total: visitors.length,
+    recent,
+    topIPs,
+    pathCounts,
+    hourly,
+    blockedIPs: _db.blockedIPs,
+  })
+})
+
+// ── POST /api/block-ip — block an IP ──────────────────────────
+app.post('/api/block-ip', requireAdminToken, (req, res) => {
+  const { ip } = req.body
+  if (!ip) return res.status(400).json({ ok: false, error: 'IP required' })
+  if (!_db.blockedIPs.includes(ip)) {
+    _db.blockedIPs.push(ip)
+    saveDB()
+    secLog('INFO', 'IP_BLOCKED', { ip, by: 'admin' })
+  }
+  res.json({ ok: true, blocked: _db.blockedIPs })
+})
+
+// ── DELETE /api/block-ip — unblock an IP ─────────────────────
+app.delete('/api/block-ip', requireAdminToken, (req, res) => {
+  const { ip } = req.body
+  if (!ip) return res.status(400).json({ ok: false, error: 'IP required' })
+  _db.blockedIPs = _db.blockedIPs.filter(b => b !== ip)
+  saveDB()
+  secLog('INFO', 'IP_UNBLOCKED', { ip, by: 'admin' })
+  res.json({ ok: true, blocked: _db.blockedIPs })
+})
+
+// ── POST /api/feedback — user submits feedback ────────────────
+app.post('/api/feedback', (req, res) => {
+  const { message, name, email, type } = req.body
+  if (!message?.trim()) return res.status(400).json({ ok: false, error: 'Message required' })
+
+  const entry = {
+    id:      Date.now().toString(36),
+    ts:      new Date().toISOString(),
+    ip:      req.ip || 'unknown',
+    name:    (name    || 'Anonymous').slice(0, 50),
+    email:   (email   || '').slice(0, 100),
+    type:    ['bug', 'feature', 'other'].includes(type) ? type : 'other',
+    message: message.trim().slice(0, 1000),
+    read:    false,
+  }
+
+  _db.feedback.unshift(entry)
+  if (_db.feedback.length > 500) _db.feedback = _db.feedback.slice(0, 500)
+  saveDB()
+  secLog('INFO', 'FEEDBACK_RECEIVED', { ip: entry.ip, type: entry.type })
+  res.json({ ok: true, id: entry.id })
+})
+
+// ── GET /api/feedback — list feedback (admin) ────────────────
+app.get('/api/feedback', requireAdminToken, (req, res) => {
+  const unread = _db.feedback.filter(f => !f.read).length
+  res.json({ ok: true, feedback: _db.feedback, unread })
+})
+
+// ── PATCH /api/feedback/:id — mark as read ────────────────────
+app.patch('/api/feedback/:id', requireAdminToken, (req, res) => {
+  const item = _db.feedback.find(f => f.id === req.params.id)
+  if (!item) return res.status(404).json({ ok: false, error: 'Not found' })
+  item.read = true
+  saveDB()
+  res.json({ ok: true })
+})
+
+// ── DELETE /api/feedback/:id — delete feedback ────────────────
+app.delete('/api/feedback/:id', requireAdminToken, (req, res) => {
+  _db.feedback = _db.feedback.filter(f => f.id !== req.params.id)
+  saveDB()
+  res.json({ ok: true })
+})
+
 // ── GET /api/logs — read log (admin only via ADMIN_TOKEN) ──────
 const BACKEND_ADMIN_TOKEN = process.env.ADMIN_TOKEN || null
 
@@ -572,12 +726,12 @@ app.get('/api/logs', requireAdminToken, (req, res) => {
     const limit = Math.min(parseInt(req.query.limit || '200'), 500)
     const level = req.query.level || ''
 
-    const lines  = fs.readFileSync(logFile, 'utf-8').trim().split('\n').filter(Boolean)
+    const lines  = fs.readFileSync(logFile, 'utf-8').trim().split('').filter(Boolean)
     const parsed = []
     for (const line of lines) {
       try {
         const e = JSON.parse(line)
-        if (level && e.level !== level) continue
+        if (level && e.level !== level) continue  
         parsed.push(e)
       } catch { /* skip */ }
     }
