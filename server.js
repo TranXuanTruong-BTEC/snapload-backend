@@ -436,20 +436,30 @@ app.get('/api/download', async (req, res) => {
     : sanitizeQuality(quality, ['2160','1080','720','480','best'])
   const safeFormat = ['mp3','mp4'].includes(format) ? format : 'mp3'
 
-  // Enforce concurrent job limit per IP
+  // iOS opens URL directly in new tab — don't block with concurrent limit
+  // (iOS streams inline, doesn't hold a long connection like desktop)
+  const dlUa  = req.headers['user-agent'] || ''
+  const dlIsIOS = /iPad|iPhone|iPod/i.test(dlUa) ||
+                  (dlUa.includes('Mac') && /like iPhone/.test(dlUa))
+
   const dlIp = req.ip || 'unknown'
-  const runningJobs = activeJobs.get(dlIp) || 0
-  if (runningJobs >= MAX_CONCURRENT) {
-    secLog('WARN', 'CONCURRENT_LIMIT', { ip: dlIp })
-    return res.status(429).json({ error: 'Too many concurrent downloads. Please wait for the current one to finish.' })
+
+  if (!dlIsIOS) {
+    // Only enforce concurrent limit for non-iOS (Android/Desktop hold connections)
+    const runningJobs = activeJobs.get(dlIp) || 0
+    if (runningJobs >= MAX_CONCURRENT) {
+      secLog('WARN', 'CONCURRENT_LIMIT', { ip: dlIp })
+      return res.status(429).json({ error: 'Too many concurrent downloads. Please wait for the current one to finish.' })
+    }
+    activeJobs.set(dlIp, runningJobs + 1)
   }
-  activeJobs.set(dlIp, runningJobs + 1)
 
   const jobId = uuidv4()
   const outTemplate = path.join(TMP_DIR, `${jobId}.%(ext)s`)
   let outFile = null
 
   const releaseJob = () => {
+    if (dlIsIOS) return  // iOS was never counted
     const cur = activeJobs.get(dlIp) || 1
     if (cur <= 1) activeJobs.delete(dlIp)
     else activeJobs.set(dlIp, cur - 1)
