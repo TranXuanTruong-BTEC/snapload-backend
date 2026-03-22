@@ -785,14 +785,6 @@ app.delete('/api/feedback/:id', requireAdminToken, (req, res) => {
 })
 
 
-function requireAdminToken(req, res, next) {
-  if (!BACKEND_ADMIN_TOKEN) return next() // no token set = open (local dev only)
-  const token = req.headers['x-admin-token'] || req.query.token
-  if (token !== BACKEND_ADMIN_TOKEN) {
-    return res.status(401).json({ error: 'Unauthorized' })
-  }
-  next()
-}
 
 app.get('/api/logs', requireAdminToken, (req, res) => {
   try {
