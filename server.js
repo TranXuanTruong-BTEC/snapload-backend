@@ -71,10 +71,37 @@ app.use(cors({
 // Handle preflight OPTIONS requests
 app.options('*', cors())
 
-app.use(express.json({ limit: '10mb' }))
+// Security headers
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  res.setHeader('X-Frame-Options', 'DENY')
+  res.setHeader('X-XSS-Protection', '1; mode=block')
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin')
+  next()
+})
 
-// Serve tmp files
-app.use('/tmp', express.static(TMP_DIR))
+app.use(express.json({ limit: '2mb' }))  // reduced from 10mb — base64 images handled in admin only
+
+// Basic request rate tracking (in-memory, resets on restart)
+const reqCount = new Map()
+app.use((req, res, next) => {
+  const ip  = req.ip || req.connection.remoteAddress || 'unknown'
+  const now = Date.now()
+  const key = `${ip}_${Math.floor(now / 60000)}` // per minute window
+  const cnt = (reqCount.get(key) || 0) + 1
+  reqCount.set(key, cnt)
+  // Clean old keys every 100 requests
+  if (reqCount.size > 500) {
+    const cutoff = Math.floor(now / 60000) - 2
+    for (const [k] of reqCount) { if (parseInt(k.split('_')[1]) < cutoff) reqCount.delete(k) }
+  }
+  if (cnt > 60) { // max 60 req/min per IP
+    return res.status(429).json({ error: 'Too many requests. Please slow down.' })
+  }
+  next()
+})
+
+// NOTE: /tmp is NOT served as static — files are streamed directly via endpoints
 
 // File upload (for convert)
 const upload = multer({
@@ -102,6 +129,25 @@ async function getFfmpeg() {
     catch { /* try next */ }
   }
   throw new Error('ffmpeg not found. Install: winget install ffmpeg (Windows) or apt install ffmpeg (Linux)')
+}
+
+// ── Security helpers ─────────────────────────────────────────
+function isValidHttpUrl(str) {
+  try {
+    const u = new URL(str)
+    // Only allow http/https — block file://, ftp://, internal IPs
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false
+    const host = u.hostname.toLowerCase()
+    // Block localhost and private IP ranges (SSRF prevention)
+    if (host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0') return false
+    if (/^10\./.test(host) || /^192\.168\./.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host)) return false
+    if (host.endsWith('.local') || host.endsWith('.internal')) return false
+    return true
+  } catch { return false }
+}
+
+function sanitizeQuality(q, allowed) {
+  return allowed.includes(String(q)) ? String(q) : allowed[0]
 }
 
 // ── Helpers ─────────────────────────────────────────────────────
@@ -153,6 +199,7 @@ app.get('/api/health', async (req, res) => {
 app.post('/api/info', async (req, res) => {
   const { url, format } = req.body
   if (!url) return res.status(400).json({ error: 'URL is required' })
+  if (!isValidHttpUrl(url)) return res.status(400).json({ error: 'Invalid or unsafe URL' })
 
   try {
     const ytDlp = await getYtDlp()
@@ -229,6 +276,12 @@ app.post('/api/info', async (req, res) => {
 app.get('/api/download', async (req, res) => {
   const { url, format, quality } = req.query
   if (!url) return res.status(400).json({ error: 'URL is required' })
+  if (!isValidHttpUrl(url)) return res.status(400).json({ error: 'Invalid or unsafe URL' })
+  // Whitelist quality values to prevent injection
+  const safeQuality = format === 'mp3'
+    ? sanitizeQuality(quality, ['320','256','192','128','best'])
+    : sanitizeQuality(quality, ['2160','1080','720','480','best'])
+  const safeFormat = ['mp3','mp4'].includes(format) ? format : 'mp3'
 
   const jobId = uuidv4()
   const outTemplate = path.join(TMP_DIR, `${jobId}.%(ext)s`)
@@ -237,8 +290,8 @@ app.get('/api/download', async (req, res) => {
   try {
     const ytDlp = await getYtDlp()
 
-    if (format === 'mp3') {
-      const q = quality || '320'
+    if (safeFormat === 'mp3') {
+      const q = safeQuality
       await execAsync(
         `${ytDlp} -x --audio-format mp3 --audio-quality ${q}k ` +
         `--no-playlist --no-warnings --no-check-certificate ` +
@@ -247,7 +300,7 @@ app.get('/api/download', async (req, res) => {
       )
       outFile = path.join(TMP_DIR, `${jobId}.mp3`)
     } else {
-      const h = quality === 'best' ? '' : `[height<=${quality || '1080'}]`
+      const h = safeQuality === 'best' ? '' : `[height<=${safeQuality}]`
       await execAsync(
         `${ytDlp} -f "bestvideo${h}[ext=mp4]+bestaudio[ext=m4a]/bestvideo${h}+bestaudio/best${h}" ` +
         `--merge-output-format mp4 ` +
@@ -294,10 +347,10 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' })
 
   const inputPath  = req.file.path
-  const quality    = req.body.quality || '320'
+  const quality    = sanitizeQuality(req.body.quality, ['320','256','192','128'])
   const jobId      = uuidv4()
   const outputPath = path.join(TMP_DIR, `${jobId}.mp3`)
-  const origName   = req.file.originalname.replace(/\.[^.]+$/, '.mp3')
+  const origName   = req.file.originalname.replace(/[^\w\s.-]/g, '').replace(/\.[^.]+$/, '').slice(0, 100) + '.mp3'
 
   try {
     const ffmpeg = await getFfmpeg()
@@ -321,7 +374,7 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
   } catch (err) {
     console.error('Convert error:', err.message)
     deleteFiles(inputPath, outputPath)
-    res.status(500).json({ error: err.message || 'Conversion failed' })
+    res.status(500).json({ error: 'Conversion failed. Please try again.' })
   }
 })
 
@@ -336,7 +389,8 @@ app.get('/api/download-converted/:filename', (req, res) => {
   }
 
   res.setHeader('Content-Type', 'audio/mpeg')
-  res.setHeader('Content-Disposition', `attachment; filename="${name}"`)
+  const safeDlName = name.replace(/[\r\n"\\]/g, '').slice(0, 200)
+  res.setHeader('Content-Disposition', `attachment; filename="${safeDlName}"`)
   res.setHeader('Content-Length', fs.statSync(filePath).size)
 
   const stream = fs.createReadStream(filePath)
