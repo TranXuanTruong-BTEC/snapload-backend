@@ -444,9 +444,9 @@ app.get('/api/download', async (req, res) => {
 
   const dlIp = req.ip || 'unknown'
 
+  const runningJobs = activeJobs.get(dlIp) || 0
   if (!dlIsIOS) {
     // Only enforce concurrent limit for non-iOS (Android/Desktop hold connections)
-    const runningJobs = activeJobs.get(dlIp) || 0
     if (runningJobs >= MAX_CONCURRENT) {
       secLog('WARN', 'CONCURRENT_LIMIT', { ip: dlIp })
       return res.status(429).json({ error: 'Too many concurrent downloads. Please wait for the current one to finish.' })
