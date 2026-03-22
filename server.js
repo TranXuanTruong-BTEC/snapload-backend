@@ -954,6 +954,117 @@ app.post('/api/batch-info', async (req, res) => {
 // (kept simple — frontend polls via SSE)
 const zipJobs = new Map() // jobId → { total, done, errors }
 
+// ── POST /api/tag — apply ID3 tags then stream file ─────────────
+// Accepts: { url, format, quality, title, artist, album, year, genre }
+// Downloads the file (or uses existing), applies ffmpeg metadata, streams back
+app.post('/api/tag', async (req, res) => {
+  const { url, format = 'mp3', quality = '320',
+          title = '', artist = '', album = '', year = '', genre = '' } = req.body
+
+  if (!url) return res.status(400).json({ error: 'URL required' })
+  if (!isValidHttpUrl(url)) return res.status(400).json({ error: 'Invalid URL' })
+
+  const safeFormat  = format === 'mp3' ? 'mp3' : 'mp4'
+  const safeQuality = safeFormat === 'mp3'
+    ? (sanitizeQuality(quality, ['320','256','192','128']))
+    : (sanitizeQuality(quality, ['2160','1080','720','480']))
+
+  // Sanitize tag values — no shell injection
+  function sanitizeTag(v) { return String(v || '').replace(/["\
+]/g, '').slice(0, 200) }
+  const tags = {
+    title:  sanitizeTag(title),
+    artist: sanitizeTag(artist),
+    album:  sanitizeTag(album),
+    year:   sanitizeTag(year).replace(/[^0-9]/g, '').slice(0, 4),
+    genre:  sanitizeTag(genre),
+  }
+
+  // Only MP3 supports ID3 tags properly
+  if (safeFormat !== 'mp3') {
+    return res.status(400).json({ error: 'ID3 tags chỉ hỗ trợ cho MP3' })
+  }
+
+  const jobId      = uuidv4()
+  const rawFile    = path.join(TMP_DIR, `${jobId}_raw.mp3`)
+  const taggedFile = path.join(TMP_DIR, `${jobId}_tagged.mp3`)
+  const outTemplate = path.join(TMP_DIR, `${jobId}_raw.%(ext)s`)
+
+  secLog('INFO', 'TAG_START', { ip: req.ip, title: tags.title, artist: tags.artist })
+
+  try {
+    const ytDlp = await getYtDlp()
+    const ffmpeg = await getFfmpeg()
+
+    // Step 1: Download MP3
+    const [ytBin, ...ytArgs] = ytDlp.split(' ')
+    await runCmd(ytBin, [
+      ...ytArgs, '-x', '--audio-format', 'mp3',
+      '--audio-quality', `${safeQuality}k`,
+      '--no-playlist', '--no-warnings', '--no-check-certificate',
+      ...getPlatformArgs(url),
+      '-o', outTemplate, url,
+    ], { timeout: 300000, maxBuffer: 50 * 1024 * 1024 })
+
+    // Find actual downloaded file
+    let srcFile = rawFile
+    if (!fs.existsSync(srcFile)) {
+      const found = fs.readdirSync(TMP_DIR).filter(f => f.startsWith(`${jobId}_raw`))
+      if (!found.length) throw new Error('Download failed')
+      srcFile = path.join(TMP_DIR, found[0])
+    }
+
+    // Step 2: Apply ID3 tags using ffmpeg metadata
+    const metadataArgs = []
+    if (tags.title)  metadataArgs.push('-metadata', `title=${tags.title}`)
+    if (tags.artist) metadataArgs.push('-metadata', `artist=${tags.artist}`)
+    if (tags.album)  metadataArgs.push('-metadata', `album=${tags.album}`)
+    if (tags.year)   metadataArgs.push('-metadata', `date=${tags.year}`)
+    if (tags.genre)  metadataArgs.push('-metadata', `genre=${tags.genre}`)
+
+    const [ffBin, ...ffArgs] = ffmpeg.split(' ')
+    await runCmd(ffBin, [
+      ...ffArgs,
+      '-i', srcFile,
+      '-c', 'copy',          // copy audio stream — no re-encode
+      ...metadataArgs,
+      '-id3v2_version', '3', // compatible ID3v2.3
+      '-y', taggedFile,
+    ], { timeout: 60000, maxBuffer: 10 * 1024 * 1024 })
+
+    const finalFile = fs.existsSync(taggedFile) ? taggedFile : srcFile
+    const size      = fs.statSync(finalFile).size
+
+    // Build filename from tags
+    const safeName  = (tags.artist && tags.title)
+      ? `${tags.artist} - ${tags.title}`.replace(/[^\w\s\-().]/g, '').slice(0, 100)
+      : (tags.title || 'snapload').replace(/[^\w\s\-().]/g, '').slice(0, 100)
+
+    res.setHeader('Content-Type', 'audio/mpeg')
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}.mp3"; filename*=UTF-8''${encodeURIComponent(safeName)}.mp3`)
+    res.setHeader('Content-Length', String(size))
+    res.setHeader('X-File-Size', String(size))
+
+    const stream = fs.createReadStream(finalFile)
+    stream.pipe(res)
+    stream.on('end', () => {
+      secLog('INFO', 'TAG_DONE', { ip: req.ip, size })
+      setTimeout(() => {
+        try { deleteFiles(srcFile, taggedFile) } catch {}
+      }, 15000)
+    })
+    stream.on('error', (e) => {
+      secLog('ERROR', 'TAG_STREAM_ERROR', { msg: e.message })
+      try { deleteFiles(srcFile, taggedFile) } catch {}
+    })
+
+  } catch (err) {
+    secLog('ERROR', 'TAG_FAIL', { ip: req.ip, msg: err.message.slice(0, 200) })
+    try { deleteFiles(rawFile, taggedFile) } catch {}
+    if (!res.headersSent) res.status(500).json({ error: 'Không thể áp dụng tag: ' + err.message.slice(0, 100) })
+  }
+})
+
 // ── GET /api/subtitle — download subtitle ────────────────────────
  — download subtitle ────────────────────────
 app.get('/api/subtitle', async (req, res) => {
