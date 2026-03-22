@@ -256,18 +256,23 @@ function deleteFiles(...paths) {
 
 // ── ROUTES ──────────────────────────────────────────────────────
 
-// Health check
-app.get('/api/health', async (req, res) => {
-  let ytdlp = false, ffmpegOk = false
-  try { await getYtDlp(); ytdlp = true } catch { /* offline */ }
-  try { await getFfmpeg(); ffmpegOk = true } catch { /* offline */ }
+// Health check — responds immediately (Railway requires fast response)
+app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
     server: 'SnapLoad Backend',
     version: '1.0.0',
-    tools: { ytdlp, ffmpeg: ffmpegOk },
+    uptime: Math.round(process.uptime()),
     port: PORT,
   })
+})
+
+// Detailed health (slow, checks tools)
+app.get('/api/health/full', async (req, res) => {
+  let ytdlp = false, ffmpegOk = false
+  try { await getYtDlp(); ytdlp = true } catch { /* not installed */ }
+  try { await getFfmpeg(); ffmpegOk = true } catch { /* not installed */ }
+  res.json({ ok: true, tools: { ytdlp, ffmpeg: ffmpegOk }, uptime: Math.round(process.uptime()) })
 })
 
 // ── POST /api/info — fetch video metadata ───────────────────────
