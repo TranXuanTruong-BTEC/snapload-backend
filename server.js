@@ -1061,7 +1061,6 @@ app.post('/api/tag', async (req, res) => {
 })
 
 // ── GET /api/subtitle — download subtitle ────────────────────────
- — download subtitle ────────────────────────
 app.get('/api/subtitle', async (req, res) => {
   const { url, lang = 'vi,en', fmt = 'srt' } = req.query
   if (!url) return res.status(400).json({ error: 'URL required' })
