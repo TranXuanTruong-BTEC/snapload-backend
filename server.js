@@ -12,6 +12,7 @@ import { promisify } from 'util'
 import { fileURLToPath } from 'url'
 import multer   from 'multer'
 import { v4 as uuidv4 } from 'uuid'
+import archiver from 'archiver'
 import { createWriteStream } from 'fs'
 
 const execFileAsync = promisify(execFile)
@@ -978,7 +979,103 @@ app.post('/api/batch-info', async (req, res) => {
   res.json({ ok: true, results })
 })
 
+// ── POST /api/playlist-zip — download multiple videos as ZIP ────
+app.post('/api/playlist-zip', async (req, res) => {
+  const { urls, format = 'mp3', quality = '320', title = 'playlist' } = req.body
+  if (!Array.isArray(urls) || !urls.length) return res.status(400).json({ error: 'urls array required' })
+  const safeUrls    = urls.filter(u => u && isValidHttpUrl(u)).slice(0, 30)
+  const safeFormat  = ['mp3','mp4'].includes(format) ? format : 'mp3'
+  const safeQuality = safeFormat === 'mp3'
+    ? (['320','256','192','128'].includes(String(quality)) ? String(quality) : '320')
+    : (['2160','1080','720','480'].includes(String(quality)) ? String(quality) : '1080')
+
+  if (!safeUrls.length) return res.status(400).json({ error: 'No valid URLs' })
+
+  const jobId  = uuidv4()
+  const jobDir = path.join(TMP_DIR, `zip_${jobId}`)
+  fs.mkdirSync(jobDir, { recursive: true })
+
+  const safeTitle = title.replace(/[^\w\s\-]/g, '').trim().slice(0, 40) || 'playlist'
+
+  secLog('INFO', 'ZIP_START', { ip: req.ip, count: safeUrls.length, format: safeFormat })
+
+  // Set headers early so browser knows it's a zip download
+  res.setHeader('Content-Type', 'application/zip')
+  res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.zip"`)
+  res.setHeader('Transfer-Encoding', 'chunked')
+  res.setHeader('X-Total', String(safeUrls.length))
+
+  const archive = archiver('zip', { zlib: { level: 0 } })  // level 0 = store only (fast)
+  archive.pipe(res)
+
+  const ytDlp = await getYtDlp()
+  let successCount = 0
+
+  for (let i = 0; i < safeUrls.length; i++) {
+    const url = safeUrls[i]
+    const fileId = `${i + 1}_${uuidv4().slice(0, 6)}`
+    const outTemplate = path.join(jobDir, `${fileId}.%(ext)s`)
+
+    try {
+      const [ytBin, ...ytArgs] = ytDlp.split(' ')
+      if (safeFormat === 'mp3') {
+        await runCmd(ytBin, [
+          ...ytArgs, '-x', '--audio-format', 'mp3',
+          '--audio-quality', `${safeQuality}k`,
+          '--no-playlist', '--no-warnings', '--no-check-certificate',
+          ...getPlatformArgs(url),
+          '-o', outTemplate, url,
+        ], { timeout: 300000, maxBuffer: 50 * 1024 * 1024 })
+      } else {
+        const fmtStr = [
+          `bestvideo[height<=${safeQuality}][ext=mp4]+bestaudio[ext=m4a]`,
+          `bestvideo[height<=${safeQuality}][ext=mp4]+bestaudio`,
+          `bestvideo[height<=${safeQuality}]+bestaudio`,
+          `best[height<=${safeQuality}]`, 'best',
+        ].join('/')
+        await runCmd(ytBin, [
+          ...ytArgs, '-f', fmtStr, '--merge-output-format', 'mp4',
+          '--no-playlist', '--no-warnings', '--no-check-certificate',
+          '--no-part', '--ffmpeg-location', '/usr/bin/ffmpeg',
+          ...getPlatformArgs(url),
+          '-o', outTemplate, url,
+        ], { timeout: 600000, maxBuffer: 100 * 1024 * 1024 })
+      }
+
+      // Find the output file
+      const files = fs.readdirSync(jobDir).filter(f => f.startsWith(fileId))
+      if (files.length) {
+        const filePath = path.join(jobDir, files[0])
+        archive.file(filePath, { name: files[0].replace(fileId + '_', '') || files[0] })
+        successCount++
+      }
+    } catch (err) {
+      secLog('WARN', 'ZIP_ITEM_FAIL', { url: url.slice(0, 80), msg: err.message.slice(0, 100) })
+      // Continue with next video even if one fails
+    }
+  }
+
+  archive.on('finish', () => {
+    secLog('INFO', 'ZIP_DONE', { ip: req.ip, success: successCount, total: safeUrls.length })
+    // Clean up temp dir after 5 min
+    setTimeout(() => {
+      try { fs.rmSync(jobDir, { recursive: true, force: true }) } catch {}
+    }, 5 * 60 * 1000)
+  })
+
+  archive.on('error', (err) => {
+    secLog('ERROR', 'ZIP_ERROR', { msg: err.message })
+  })
+
+  archive.finalize()
+})
+
+// ── GET /api/playlist-zip-status — SSE progress stream ──────────
+// (kept simple — frontend polls via SSE)
+const zipJobs = new Map() // jobId → { total, done, errors }
+
 // ── GET /api/subtitle — download subtitle ────────────────────────
+ — download subtitle ────────────────────────
 app.get('/api/subtitle', async (req, res) => {
   const { url, lang = 'vi,en', fmt = 'srt' } = req.query
   if (!url) return res.status(400).json({ error: 'URL required' })
