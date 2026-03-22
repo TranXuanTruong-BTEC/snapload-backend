@@ -302,6 +302,38 @@ function detectPlatform(url) {
   return 'Web'
 }
 
+// Platform-specific yt-dlp extra args
+function getPlatformArgs(url) {
+  const u = url.toLowerCase()
+  const args = []
+
+  // Instagram: needs user-agent + extra headers to avoid 401
+  if (u.includes('instagram.com')) {
+    args.push(
+      '--add-header', 'User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
+      '--add-header', 'Accept-Language:en-US,en;q=0.9',
+    )
+  }
+
+  // TikTok: needs referer
+  if (u.includes('tiktok.com')) {
+    args.push(
+      '--add-header', 'Referer:https://www.tiktok.com/',
+      '--add-header', 'User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    )
+  }
+
+  // Twitter/X: use API extractor
+  if (u.includes('twitter.com') || u.includes('x.com')) {
+    args.push('--extractor-args', 'twitter:api=legacy')
+  }
+
+  // All: rotate user-agent for better compatibility
+  args.push('--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+
+  return args
+}
+
 function cleanTmp() {
   try {
     const MAX_AGE = 30 * 60 * 1000
@@ -355,7 +387,9 @@ app.post('/api/info', async (req, res) => {
     const [ytBin, ...ytArgs] = ytDlp.split(' ')
     const { stdout } = await runCmd(ytBin, [
       ...ytArgs,
-      '--dump-json', '--no-playlist', '--no-warnings', '--no-check-certificate', url
+      '--dump-json', '--no-playlist', '--no-warnings', '--no-check-certificate',
+      ...getPlatformArgs(url),
+      url
     ], { timeout: 30000 })
 
     const info     = JSON.parse(stdout.trim().split('\n')[0])
@@ -475,6 +509,7 @@ app.get('/api/download', async (req, res) => {
       await runCmd(yb1, [
         ...ya1, '-x', '--audio-format', 'mp3', '--audio-quality', `${q}k`,
         '--no-playlist', '--no-warnings', '--no-check-certificate',
+        ...getPlatformArgs(url),
         '-o', outTemplate, url
       ], { timeout: 300000, maxBuffer: 50 * 1024 * 1024 })
       outFile = path.join(TMP_DIR, `${jobId}.mp3`)
@@ -495,10 +530,11 @@ app.get('/api/download', async (req, res) => {
         '-f', fmtStr,
         '--merge-output-format', 'mp4',
         '--no-playlist', '--no-warnings', '--no-check-certificate',
-        '--no-part',                          // no .part temp files
-        '--ffmpeg-location', '/usr/bin/ffmpeg', // explicit ffmpeg path in Docker
+        '--no-part',
+        '--ffmpeg-location', '/usr/bin/ffmpeg',
+        ...getPlatformArgs(url),
         '-o', outTemplate, url,
-      ], { timeout: 600000, maxBuffer: 100 * 1024 * 1024 })  // 10 min, 100MB buffer
+      ], { timeout: 600000, maxBuffer: 100 * 1024 * 1024 })
       outFile = path.join(TMP_DIR, `${jobId}.mp4`)
     }
 
