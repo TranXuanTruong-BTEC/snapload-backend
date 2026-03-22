@@ -12,6 +12,7 @@ import { promisify } from 'util'
 import { fileURLToPath } from 'url'
 import multer   from 'multer'
 import { v4 as uuidv4 } from 'uuid'
+import { createWriteStream } from 'fs'
 
 const execFileAsync = promisify(execFile)
 
@@ -24,6 +25,25 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 // ── Config ─────────────────────────────────────────────────────
 const PORT    = process.env.PORT || 4000
 const TMP_DIR = process.env.TMP_DIR || path.join(__dirname, 'tmp')
+const LOG_DIR = path.join(__dirname, 'logs')
+
+// ── Security Logger ─────────────────────────────────────────
+if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true })
+
+const _logStream = createWriteStream(path.join(LOG_DIR, 'security.log'), { flags: 'a' })
+
+function secLog(level, event, data = {}) {
+  const entry = {
+    ts:    new Date().toISOString(),
+    level,
+    event,
+    ...data,
+  }
+  _logStream.write(JSON.stringify(entry) + '\n')
+  if (level === 'WARN' || level === 'ERROR') {
+    console.warn(`[${level}] ${event}`, data)
+  }
+}
 
 // CORS: allow your Cloudflare Pages domain + localhost dev
 // ── CORS config ─────────────────────────────────────────────────
@@ -116,10 +136,12 @@ function checkRateLimit(ip, endpoint, max) {
 }
 
 app.use((req, res, next) => {
-  const ip = req.ip || 'unknown'
+  const ip  = req.ip || 'unknown'
+  const ua  = req.headers['user-agent'] || ''
   const limits = { '/api/download': 10, '/api/convert': 5, '/api/info': 20 }
   const max = limits[req.path] || 60
   if (checkRateLimit(ip, req.path, max)) {
+    secLog('WARN', 'RATE_LIMIT', { ip, path: req.path, ua: ua.slice(0, 80) })
     return res.status(429).json({ error: 'Too many requests. Please wait a moment.' })
   }
   next()
@@ -252,7 +274,10 @@ app.get('/api/health', async (req, res) => {
 app.post('/api/info', async (req, res) => {
   const { url, format } = req.body
   if (!url) return res.status(400).json({ error: 'URL is required' })
-  if (!isValidHttpUrl(url)) return res.status(400).json({ error: 'Invalid or unsafe URL' })
+  if (!isValidHttpUrl(url)) {
+    secLog('WARN', 'INVALID_URL', { ip: req.ip, url: url.slice(0, 120) })
+    return res.status(400).json({ error: 'Invalid or unsafe URL' })
+  }
 
   try {
     const ytDlp = await getYtDlp()
@@ -330,18 +355,37 @@ app.post('/api/info', async (req, res) => {
 app.get('/api/download', async (req, res) => {
   const { url, format, quality } = req.query
   if (!url) return res.status(400).json({ error: 'URL is required' })
-  if (!isValidHttpUrl(url)) return res.status(400).json({ error: 'Invalid or unsafe URL' })
+  if (!isValidHttpUrl(url)) {
+    secLog('WARN', 'INVALID_URL', { ip: req.ip, url: url.slice(0, 120) })
+    return res.status(400).json({ error: 'Invalid or unsafe URL' })
+  }
   // Whitelist quality values to prevent injection
   const safeQuality = format === 'mp3'
     ? sanitizeQuality(quality, ['320','256','192','128','best'])
     : sanitizeQuality(quality, ['2160','1080','720','480','best'])
   const safeFormat = ['mp3','mp4'].includes(format) ? format : 'mp3'
 
+  // Enforce concurrent job limit per IP
+  const dlIp = req.ip || 'unknown'
+  const runningJobs = activeJobs.get(dlIp) || 0
+  if (runningJobs >= MAX_CONCURRENT) {
+    secLog('WARN', 'CONCURRENT_LIMIT', { ip: dlIp })
+    return res.status(429).json({ error: 'Too many concurrent downloads. Please wait for the current one to finish.' })
+  }
+  activeJobs.set(dlIp, runningJobs + 1)
+
   const jobId = uuidv4()
   const outTemplate = path.join(TMP_DIR, `${jobId}.%(ext)s`)
   let outFile = null
 
+  const releaseJob = () => {
+    const cur = activeJobs.get(dlIp) || 1
+    if (cur <= 1) activeJobs.delete(dlIp)
+    else activeJobs.set(dlIp, cur - 1)
+  }
+
   try {
+    secLog('INFO', 'DOWNLOAD_START', { ip: dlIp, format: safeFormat, quality: safeQuality, jobs: runningJobs + 1 })
     const ytDlp = await getYtDlp()
 
     if (safeFormat === 'mp3') {
@@ -384,12 +428,20 @@ app.get('/api/download', async (req, res) => {
 
     const stream = fs.createReadStream(outFile)
     stream.pipe(res)
-    stream.on('end', () => setTimeout(() => deleteFiles(outFile), 10000))
-    stream.on('error', () => deleteFiles(outFile))
+    stream.on('end', () => {
+      releaseJob()
+      secLog('INFO', 'DOWNLOAD_DONE', { ip: dlIp, size, format: safeFormat })
+      setTimeout(() => deleteFiles(outFile), 10000)
+    })
+    stream.on('error', (e) => {
+      releaseJob()
+      secLog('ERROR', 'STREAM_ERROR', { ip: dlIp, msg: e.message })
+      deleteFiles(outFile)
+    })
 
   } catch (err) {
-    console.error('Download error:', err.message)
-    // Clean partial files
+    releaseJob()
+    secLog('ERROR', 'DOWNLOAD_FAIL', { ip: dlIp, msg: err.message.slice(0, 200) })
     fs.readdirSync(TMP_DIR).filter(f => f.startsWith(jobId)).forEach(f =>
       deleteFiles(path.join(TMP_DIR, f))
     )
@@ -407,7 +459,32 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
   const outputPath = path.join(TMP_DIR, `${jobId}.mp3`)
   const origName   = req.file.originalname.replace(/[^\w\s.-]/g, '').replace(/\.[^.]+$/, '').slice(0, 100) + '.mp3'
 
+  // ── Magic bytes validation — verify file is actually a video ──
+  // MIME type header is trivially spoofed; check actual file signature
   try {
+    const buf = Buffer.alloc(12)
+    const fd  = fs.openSync(inputPath, 'r')
+    fs.readSync(fd, buf, 0, 12, 0)
+    fs.closeSync(fd)
+
+    const isMp4  = buf.slice(4, 8).toString('ascii') === 'ftyp'          // MP4/MOV
+    const isMkv  = buf[0] === 0x1A && buf[1] === 0x45                    // MKV/WebM
+    const isAvi  = buf.slice(0, 4).toString('ascii') === 'RIFF'          // AVI
+    const isMpeg = buf[0] === 0x00 && buf[1] === 0x00 && buf[2] === 0x01 // MPEG
+    const isFlv  = buf.slice(0, 3).toString('ascii') === 'FLV'           // FLV
+
+    if (!isMp4 && !isMkv && !isAvi && !isMpeg && !isFlv) {
+      deleteFiles(inputPath)
+      secLog('WARN', 'INVALID_MAGIC_BYTES', { ip: req.ip, mime: req.file.mimetype, hex: buf.slice(0,8).toString('hex') })
+      return res.status(400).json({ error: 'Invalid file — not a recognized video format' })
+    }
+  } catch (magicErr) {
+    deleteFiles(inputPath)
+    return res.status(400).json({ error: 'Could not read uploaded file' })
+  }
+
+  try {
+    secLog('INFO', 'CONVERT_START', { ip: req.ip, size: req.file.size, quality })
     const ffmpeg = await getFfmpeg()
     const [ffBin,...ffArgs] = ffmpeg.split(' ')
     await runCmd(ffBin, [
@@ -420,6 +497,7 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
     const BASE  = `${req.protocol}://${req.get('host')}`
     const sizeMB = (fs.statSync(outputPath).size / 1024 / 1024).toFixed(1)
 
+    secLog('INFO', 'CONVERT_DONE', { ip: req.ip, sizeMB })
     res.json({
       ok: true,
       downloadUrl: `${BASE}/api/download-converted/${jobId}.mp3?name=${encodeURIComponent(origName)}`,
@@ -427,7 +505,7 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
       filename: origName,
     })
   } catch (err) {
-    console.error('Convert error:', err.message)
+    secLog('ERROR', 'CONVERT_FAIL', { ip: req.ip, msg: err.message.slice(0, 200) })
     deleteFiles(inputPath, outputPath)
     res.status(500).json({ error: 'Conversion failed. Please try again.' })
   }
