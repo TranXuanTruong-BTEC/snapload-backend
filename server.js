@@ -914,12 +914,20 @@ app.post('/api/playlist', async (req, res) => {
     for (const line of lines) {
       try {
         const v = JSON.parse(line)
+        // Normalize to full YouTube URL
+        let videoUrl = v.webpage_url || v.url || ''
+        if (!videoUrl.startsWith('http')) {
+          videoUrl = `https://www.youtube.com/watch?v=${v.id}`
+        }
+        // Remove any double-encoding
+        try { videoUrl = decodeURIComponent(videoUrl) } catch {}
+
         items.push({
           id:       v.id,
           title:    v.title || v.id,
           duration: v.duration ? `${Math.floor(v.duration/60)}:${String(v.duration%60).padStart(2,'0')}` : '',
           thumb:    v.thumbnail || v.thumbnails?.[0]?.url || '',
-          url:      v.url || v.webpage_url || `https://www.youtube.com/watch?v=${v.id}`,
+          url:      videoUrl,
         })
       } catch {}
     }
