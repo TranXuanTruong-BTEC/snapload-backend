@@ -492,10 +492,30 @@ app.get('/api/download', async (req, res) => {
     const mimeType = ext === 'mp3' ? 'audio/mpeg' : 'video/mp4'
     const size     = fs.statSync(outFile).size
 
+    // ── Mobile-aware headers ──────────────────────────────────
+    // iOS Safari needs Content-Type without attachment to show native player
+    // Android/Desktop gets attachment for direct save
+    const ua        = req.headers['user-agent'] || ''
+    const isIOS     = /iPad|iPhone|iPod/i.test(ua) ||
+                      (ua.includes('Mac') && /like iPhone/.test(ua))
+    const safeTitle = (req.query.title || 'snapload')
+                        .replace(/[^\w\s.-]/g, '').trim().slice(0, 60) || 'snapload'
+    const dlName    = `${safeTitle}.${ext}`
+
     res.setHeader('Content-Type', mimeType)
-    res.setHeader('Content-Disposition', `attachment; filename="snapload.${ext}"`)
+    res.setHeader('Accept-Ranges', 'bytes')
     res.setHeader('Content-Length', size)
     res.setHeader('X-File-Size', size)
+    res.setHeader('Cache-Control', 'no-cache, no-store')
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Disposition, X-File-Size')
+
+    if (isIOS) {
+      // iOS: inline so Safari can show native controls + Download button
+      res.setHeader('Content-Disposition', `inline; filename="${dlName}"`)
+    } else {
+      // Android + Desktop: force-download to Downloads folder
+      res.setHeader('Content-Disposition', `attachment; filename="${dlName}"; filename*=UTF-8''${encodeURIComponent(dlName)}`)
+    }
 
     const stream = fs.createReadStream(outFile)
     stream.pipe(res)
@@ -595,9 +615,20 @@ app.get('/api/download-converted/:filename', (req, res) => {
   // Only serve .mp3 files from this endpoint
   if (!safe.endsWith('.mp3')) return res.status(400).json({ error: 'Invalid file type' })
   res.setHeader('Content-Type', 'audio/mpeg')
-  const safeDlName = name.replace(/[^\w\s.-]/g, '').slice(0, 100) + '.mp3'
-  res.setHeader('Content-Disposition', `attachment; filename="${safeDlName}"`)
-  res.setHeader('Content-Length', fs.statSync(filePath).size)
+  res.setHeader('Accept-Ranges', 'bytes')
+  res.setHeader('Cache-Control', 'no-cache, no-store')
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Disposition, X-File-Size')
+  const ua2 = req.headers['user-agent'] || ''
+  const isIOS2 = /iPad|iPhone|iPod/i.test(ua2)
+  const safeDlName = (name || 'snapload').replace(/[^\w\s.-]/g, '').slice(0, 100) + '.mp3'
+  const fileSize2 = fs.statSync(filePath).size
+  res.setHeader('Content-Length', fileSize2)
+  res.setHeader('X-File-Size', fileSize2)
+  if (isIOS2) {
+    res.setHeader('Content-Disposition', `inline; filename="${safeDlName}"`)
+  } else {
+    res.setHeader('Content-Disposition', `attachment; filename="${safeDlName}"; filename*=UTF-8''${encodeURIComponent(safeDlName)}`)
+  }
 
   const stream = fs.createReadStream(filePath)
   stream.pipe(res)
