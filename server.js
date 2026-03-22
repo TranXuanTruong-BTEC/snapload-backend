@@ -28,9 +28,21 @@ const TMP_DIR = process.env.TMP_DIR || path.join(__dirname, 'tmp')
 const LOG_DIR = path.join(__dirname, 'logs')
 
 // ── Security Logger ─────────────────────────────────────────
-if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true })
+try {
+  if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true })
+} catch (e) {
+  console.warn('Could not create logs dir:', e.message)
+}
 
-const _logStream = createWriteStream(path.join(LOG_DIR, 'security.log'), { flags: 'a' })
+const _logStream = (() => {
+  try {
+    return createWriteStream(path.join(LOG_DIR, 'security.log'), { flags: 'a' })
+  } catch (e) {
+    console.warn('Could not open log file:', e.message)
+    // Fallback: write to stdout only
+    return { write: (s) => process.stdout.write(s) }
+  }
+})()
 
 function secLog(level, event, data = {}) {
   const entry = {
@@ -52,6 +64,8 @@ const ALLOWED_ORIGINS = [
   // Local dev
   'http://localhost:5173',
   'http://localhost:5174',
+  'http://localhost:5200',  // admin dashboard
+  'http://127.0.0.1:5200', // admin dashboard
   'http://localhost:4173',
   'http://localhost:3000',
   // Production — your actual Cloudflare Pages domain
@@ -91,7 +105,7 @@ app.use(cors({
     }
   },
   methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-token'],
   credentials: true,
 }))
 
@@ -621,18 +635,24 @@ app.get('/api/stats', requireAdminToken, (req, res) => {
 })
 
 // ── Start ───────────────────────────────────────────────────────
-app.listen(PORT, '0.0.0.0', async () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n${'═'.repeat(54)}`)
-  console.log(`  🚀 SnapLoad Backend`)
-  console.log(`  📡 http://localhost:${PORT}`)
+  console.log(`  🚀 SnapLoad Backend — listening on port ${PORT}`)
+  console.log(`  📡 http://0.0.0.0:${PORT}`)
   console.log(`  📂 Tmp: ${TMP_DIR}`)
-
-  // Check tools on startup
-  try { const v = await getYtDlp(); console.log(`  ✅ yt-dlp: ${v}`) }
-  catch (e) { console.log(`  ❌ yt-dlp: NOT FOUND — ${e.message}`) }
-
-  try { const v = await getFfmpeg(); console.log(`  ✅ ffmpeg: ${v}`) }
-  catch (e) { console.log(`  ❌ ffmpeg: NOT FOUND — ${e.message}`) }
-
+  console.log(`  ✅ Ready to accept requests`)
   console.log(`${'═'.repeat(54)}\n`)
+
+  // Check tools AFTER server is already listening (non-blocking)
+  Promise.all([
+    getYtDlp().then(v  => console.log(`  ✅ yt-dlp:  ${v}`))
+              .catch(e => console.log(`  ❌ yt-dlp:  NOT FOUND — ${e.message}`)),
+    getFfmpeg().then(v  => console.log(`  ✅ ffmpeg:  ${v}`))
+              .catch(e => console.log(`  ❌ ffmpeg:  NOT FOUND — ${e.message}`)),
+  ])
+})
+
+server.on('error', (err) => {
+  console.error('Server error:', err.message)
+  process.exit(1)
 })
