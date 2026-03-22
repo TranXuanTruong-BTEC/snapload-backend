@@ -7,13 +7,18 @@ import express  from 'express'
 import cors     from 'cors'
 import fs       from 'fs'
 import path     from 'path'
-import { exec } from 'child_process'
+import { execFile } from 'child_process'
 import { promisify } from 'util'
 import { fileURLToPath } from 'url'
 import multer   from 'multer'
 import { v4 as uuidv4 } from 'uuid'
 
-const execAsync = promisify(exec)
+const execFileAsync = promisify(execFile)
+
+// Safe shell executor — uses execFile (no shell interpolation)
+async function runCmd(bin, args, opts = {}) {
+  return execFileAsync(bin, args, { ...opts, shell: false })
+}
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 // ── Config ─────────────────────────────────────────────────────
@@ -53,6 +58,8 @@ if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true })
 
 // ── App ─────────────────────────────────────────────────────────
 const app = express()
+// Trust Railway/Render reverse proxy — but only 1 hop
+app.set('trust proxy', 1)
 
 app.use(cors({
   origin: (origin, cb) => {
@@ -76,37 +83,61 @@ app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff')
   res.setHeader('X-Frame-Options', 'DENY')
   res.setHeader('X-XSS-Protection', '1; mode=block')
-  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin')
+  res.setHeader('Referrer-Policy', 'no-referrer')
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
+  res.setHeader('Cache-Control', 'no-store')
+  res.removeHeader('X-Powered-By')
   next()
 })
 
 app.use(express.json({ limit: '2mb' }))  // reduced from 10mb — base64 images handled in admin only
 
-// Basic request rate tracking (in-memory, resets on restart)
-const reqCount = new Map()
-app.use((req, res, next) => {
-  const ip  = req.ip || req.connection.remoteAddress || 'unknown'
-  const now = Date.now()
-  const key = `${ip}_${Math.floor(now / 60000)}` // per minute window
+// Rate limiting — per-IP, per-minute, per-endpoint
+const reqCount    = new Map()
+const activeJobs  = new Map() // track concurrent downloads per IP
+const MAX_CONCURRENT = 2     // max 2 simultaneous downloads per IP
+
+function getRateKey(ip, endpoint) {
+  return `${ip}|${endpoint}|${Math.floor(Date.now() / 60000)}`
+}
+
+function checkRateLimit(ip, endpoint, max) {
+  const key = getRateKey(ip, endpoint)
   const cnt = (reqCount.get(key) || 0) + 1
   reqCount.set(key, cnt)
-  // Clean old keys every 100 requests
-  if (reqCount.size > 500) {
-    const cutoff = Math.floor(now / 60000) - 2
-    for (const [k] of reqCount) { if (parseInt(k.split('_')[1]) < cutoff) reqCount.delete(k) }
+  if (reqCount.size > 1000) {
+    const cutoff = Math.floor(Date.now() / 60000) - 2
+    for (const [k] of reqCount) {
+      const parts = k.split('|')
+      if (parseInt(parts[2]) < cutoff) reqCount.delete(k)
+    }
   }
-  if (cnt > 60) { // max 60 req/min per IP
-    return res.status(429).json({ error: 'Too many requests. Please slow down.' })
+  return cnt > max
+}
+
+app.use((req, res, next) => {
+  const ip = req.ip || 'unknown'
+  const limits = { '/api/download': 10, '/api/convert': 5, '/api/info': 20 }
+  const max = limits[req.path] || 60
+  if (checkRateLimit(ip, req.path, max)) {
+    return res.status(429).json({ error: 'Too many requests. Please wait a moment.' })
   }
   next()
 })
 
 // NOTE: /tmp is NOT served as static — files are streamed directly via endpoints
 
-// File upload (for convert)
+// File upload (for convert) — only accept video files, reduced to 200MB
 const upload = multer({
   dest: TMP_DIR,
-  limits: { fileSize: 500 * 1024 * 1024 }, // 500MB
+  limits: { fileSize: 200 * 1024 * 1024 }, // 200MB max
+  fileFilter: (req, file, cb) => {
+    const allowed = ['video/mp4','video/x-msvideo','video/quicktime','video/x-matroska','video/webm']
+    if (!allowed.includes(file.mimetype)) {
+      return cb(new Error('Only video files are allowed'), false)
+    }
+    cb(null, true)
+  },
 })
 
 // ── Tool detection ──────────────────────────────────────────────
@@ -116,7 +147,7 @@ let _ffmpeg = null
 async function getYtDlp() {
   if (_ytDlp) return _ytDlp
   for (const cmd of ['yt-dlp', '/usr/local/bin/yt-dlp', 'python3 -m yt_dlp']) {
-    try { await execAsync(`${cmd} --version`, { timeout: 5000 }); _ytDlp = cmd; return cmd }
+    try { const [bin,...a] = cmd.split(' '); await runCmd(bin, [...a,'--version'], { timeout: 5000 }); _ytDlp = cmd; return cmd }
     catch { /* try next */ }
   }
   throw new Error('yt-dlp not found. Install: winget install yt-dlp (Windows) or apt install yt-dlp (Linux)')
@@ -125,7 +156,7 @@ async function getYtDlp() {
 async function getFfmpeg() {
   if (_ffmpeg) return _ffmpeg
   for (const cmd of ['ffmpeg', '/usr/bin/ffmpeg']) {
-    try { await execAsync(`${cmd} -version`, { timeout: 5000 }); _ffmpeg = cmd; return cmd }
+    try { const [bin,...a] = cmd.split(' '); await runCmd(bin, [...a,'-version'], { timeout: 5000 }); _ffmpeg = cmd; return cmd }
     catch { /* try next */ }
   }
   throw new Error('ffmpeg not found. Install: winget install ffmpeg (Windows) or apt install ffmpeg (Linux)')
@@ -135,13 +166,35 @@ async function getFfmpeg() {
 function isValidHttpUrl(str) {
   try {
     const u = new URL(str)
-    // Only allow http/https — block file://, ftp://, internal IPs
     if (u.protocol !== 'http:' && u.protocol !== 'https:') return false
     const host = u.hostname.toLowerCase()
-    // Block localhost and private IP ranges (SSRF prevention)
-    if (host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0') return false
-    if (/^10\./.test(host) || /^192\.168\./.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host)) return false
-    if (host.endsWith('.local') || host.endsWith('.internal')) return false
+
+    // Block all localhost variants
+    if (['localhost','127.0.0.1','0.0.0.0','::1','0'].includes(host)) return false
+    // Block short IPs like 127.1
+    if (/^127\./.test(host)) return false
+    // Block private ranges
+    if (/^10\./.test(host)) return false
+    if (/^192\.168\./.test(host)) return false
+    if (/^172\.(1[6-9]|2\d|3[01])\./.test(host)) return false
+    // Block link-local (AWS/GCP metadata)
+    if (/^169\.254\./.test(host)) return false
+    // Block cloud metadata endpoints
+    if (['metadata.google.internal','metadata.goog'].includes(host)) return false
+    // Block octal/decimal encoded IPs
+    if (/^[0-9]+$/.test(host)) return false          // pure decimal IP
+    if (/^0[0-7]/.test(host.split('.')[0])) return false // octal
+    // Block IPv6 loopback/private
+    if (host.startsWith('[')) {
+      const v6 = host.slice(1,-1)
+      if (v6 === '::1' || v6.startsWith('fc') || v6.startsWith('fd')) return false
+    }
+    // Must have a real TLD
+    if (!host.includes('.') && !host.startsWith('[')) return false
+    // Block .local, .internal, .localhost
+    if (host.endsWith('.local') || host.endsWith('.internal') || host.endsWith('.localhost')) return false
+    // Block URL credential attacks like http://attacker@127.0.0.1/
+    if (u.username || u.password) return false
     return true
   } catch { return false }
 }
@@ -203,10 +256,11 @@ app.post('/api/info', async (req, res) => {
 
   try {
     const ytDlp = await getYtDlp()
-    const { stdout } = await execAsync(
-      `${ytDlp} --dump-json --no-playlist --no-warnings --no-check-certificate "${url}"`,
-      { timeout: 30000 }
-    )
+    const [ytBin, ...ytArgs] = ytDlp.split(' ')
+    const { stdout } = await runCmd(ytBin, [
+      ...ytArgs,
+      '--dump-json', '--no-playlist', '--no-warnings', '--no-check-certificate', url
+    ], { timeout: 30000 })
 
     const info     = JSON.parse(stdout.trim().split('\n')[0])
     const platform = detectPlatform(url)
@@ -292,22 +346,23 @@ app.get('/api/download', async (req, res) => {
 
     if (safeFormat === 'mp3') {
       const q = safeQuality
-      await execAsync(
-        `${ytDlp} -x --audio-format mp3 --audio-quality ${q}k ` +
-        `--no-playlist --no-warnings --no-check-certificate ` +
-        `-o "${outTemplate}" "${url}"`,
-        { timeout: 180000, maxBuffer: 10 * 1024 * 1024 }
-      )
+      const [yb1,...ya1] = ytDlp.split(' ')
+      await runCmd(yb1, [
+        ...ya1, '-x', '--audio-format', 'mp3', '--audio-quality', `${q}k`,
+        '--no-playlist', '--no-warnings', '--no-check-certificate',
+        '-o', outTemplate, url
+      ], { timeout: 180000, maxBuffer: 10 * 1024 * 1024 })
       outFile = path.join(TMP_DIR, `${jobId}.mp3`)
     } else {
-      const h = safeQuality === 'best' ? '' : `[height<=${safeQuality}]`
-      await execAsync(
-        `${ytDlp} -f "bestvideo${h}[ext=mp4]+bestaudio[ext=m4a]/bestvideo${h}+bestaudio/best${h}" ` +
-        `--merge-output-format mp4 ` +
-        `--no-playlist --no-warnings --no-check-certificate ` +
-        `-o "${outTemplate}" "${url}"`,
-        { timeout: 300000, maxBuffer: 10 * 1024 * 1024 }
-      )
+      const fmtStr = safeQuality === 'best'
+        ? 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best'
+        : `bestvideo[height<=${safeQuality}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${safeQuality}]+bestaudio/best[height<=${safeQuality}]`
+      const [yb2,...ya2] = ytDlp.split(' ')
+      await runCmd(yb2, [
+        ...ya2, '-f', fmtStr, '--merge-output-format', 'mp4',
+        '--no-playlist', '--no-warnings', '--no-check-certificate',
+        '-o', outTemplate, url
+      ], { timeout: 300000, maxBuffer: 10 * 1024 * 1024 })
       outFile = path.join(TMP_DIR, `${jobId}.mp4`)
     }
 
@@ -338,7 +393,7 @@ app.get('/api/download', async (req, res) => {
     fs.readdirSync(TMP_DIR).filter(f => f.startsWith(jobId)).forEach(f =>
       deleteFiles(path.join(TMP_DIR, f))
     )
-    if (!res.headersSent) res.status(500).json({ error: err.message || 'Download failed' })
+    if (!res.headersSent) res.status(500).json({ error: 'Download failed. Please try again.' })
   }
 })
 
@@ -354,10 +409,10 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
 
   try {
     const ffmpeg = await getFfmpeg()
-    await execAsync(
-      `${ffmpeg} -i "${inputPath}" -vn -ar 44100 -ac 2 -b:a ${quality}k "${outputPath}"`,
-      { timeout: 300000, maxBuffer: 50 * 1024 * 1024 }
-    )
+    const [ffBin,...ffArgs] = ffmpeg.split(' ')
+    await runCmd(ffBin, [
+      ...ffArgs, '-i', inputPath, '-vn', '-ar', '44100', '-ac', '2', '-b:a', `${quality}k`, outputPath
+    ], { timeout: 300000, maxBuffer: 50 * 1024 * 1024 })
     deleteFiles(inputPath)
 
     if (!fs.existsSync(outputPath)) throw new Error('Conversion produced no output')
@@ -388,8 +443,10 @@ app.get('/api/download-converted/:filename', (req, res) => {
     return res.status(404).json({ error: 'File expired or not found' })
   }
 
+  // Only serve .mp3 files from this endpoint
+  if (!safe.endsWith('.mp3')) return res.status(400).json({ error: 'Invalid file type' })
   res.setHeader('Content-Type', 'audio/mpeg')
-  const safeDlName = name.replace(/[\r\n"\\]/g, '').slice(0, 200)
+  const safeDlName = name.replace(/[^\w\s.-]/g, '').slice(0, 100) + '.mp3'
   res.setHeader('Content-Disposition', `attachment; filename="${safeDlName}"`)
   res.setHeader('Content-Length', fs.statSync(filePath).size)
 
