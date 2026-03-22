@@ -23,6 +23,16 @@ async function runCmd(bin, args, opts = {}) {
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 // ── Config ─────────────────────────────────────────────────────
+// Catch startup errors
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION:', err.message)
+  console.error(err.stack)
+  process.exit(1)
+})
+process.on('unhandledRejection', (reason) => {
+  console.error('UNHANDLED REJECTION:', reason)
+})
+
 const PORT    = process.env.PORT || 4000
 const TMP_DIR = process.env.TMP_DIR || path.join(__dirname, 'tmp')
 const LOG_DIR = path.join(__dirname, 'logs')
