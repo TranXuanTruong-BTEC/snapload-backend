@@ -604,6 +604,22 @@ app.get('/api/download-converted/:filename', (req, res) => {
   stream.on('end', () => setTimeout(() => deleteFiles(filePath), 10000))
 })
 
+// ── POST /api/pageview — lightweight page view ping (public) ──
+app.post('/api/pageview', (req, res) => {
+  const { path: pagePath, ref } = req.body || {}
+  const entry = {
+    ts:   new Date().toISOString(),
+    ip:   req.ip || 'unknown',
+    path: (pagePath || '/').slice(0, 80),
+    ua:   (req.headers['user-agent'] || '').slice(0, 120),
+    ref:  (ref || req.headers['referer'] || '').slice(0, 80),
+    type: 'pageview',
+  }
+  visitors.push(entry)
+  if (visitors.length > MAX_VISITORS) visitors.splice(0, visitors.length - MAX_VISITORS)
+  res.json({ ok: true })
+})
+
 // ── GET /api/visitors — visitor stats ────────────────────────
 app.get('/api/visitors', requireAdminToken, (req, res) => {
   const limit = parseInt(req.query.limit || '200')
@@ -726,12 +742,13 @@ app.get('/api/logs', requireAdminToken, (req, res) => {
     const limit = Math.min(parseInt(req.query.limit || '200'), 500)
     const level = req.query.level || ''
 
-    const lines  = fs.readFileSync(logFile, 'utf-8').trim().split('').filter(Boolean)
+    const lines  = fs.readFileSync(logFile, 'utf-8').trim().split('
+').filter(Boolean)
     const parsed = []
     for (const line of lines) {
       try {
         const e = JSON.parse(line)
-        if (level && e.level !== level) continue  
+        if (level && e.level !== level) continue
         parsed.push(e)
       } catch { /* skip */ }
     }
@@ -760,7 +777,8 @@ app.get('/api/stats', requireAdminToken, (req, res) => {
     const logFile = path.join(LOG_DIR, 'security.log')
     if (!fs.existsSync(logFile)) return res.json({ ok: true, stats: { total:0, warn:0, error:0, events:{}, topIps:[], hourly:[] } })
 
-    const lines = fs.readFileSync(logFile, 'utf-8').trim().split('\n').filter(Boolean)
+    const lines = fs.readFileSync(logFile, 'utf-8').trim().split('
+').filter(Boolean)
     let total = 0, warn = 0, error = 0
     const events = {}, ips = {}, byHour = {}
 
