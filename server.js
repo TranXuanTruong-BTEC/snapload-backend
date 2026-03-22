@@ -533,6 +533,88 @@ app.get('/api/download-converted/:filename', (req, res) => {
   stream.on('end', () => setTimeout(() => deleteFiles(filePath), 10000))
 })
 
+// ── GET /api/logs — read log (admin only via ADMIN_TOKEN) ──────
+const BACKEND_ADMIN_TOKEN = process.env.ADMIN_TOKEN || null
+
+function requireAdminToken(req, res, next) {
+  if (!BACKEND_ADMIN_TOKEN) return next() // no token set = open (local dev only)
+  const token = req.headers['x-admin-token'] || req.query.token
+  if (token !== BACKEND_ADMIN_TOKEN) {
+    return res.status(401).json({ error: 'Unauthorized' })
+  }
+  next()
+}
+
+app.get('/api/logs', requireAdminToken, (req, res) => {
+  try {
+    const logFile = path.join(LOG_DIR, 'security.log')
+    if (!fs.existsSync(logFile)) return res.json({ ok: true, logs: [], total: 0 })
+
+    const limit = Math.min(parseInt(req.query.limit || '200'), 500)
+    const level = req.query.level || ''
+
+    const lines  = fs.readFileSync(logFile, 'utf-8').trim().split('
+').filter(Boolean)
+    const parsed = []
+    for (const line of lines) {
+      try {
+        const e = JSON.parse(line)
+        if (level && e.level !== level) continue
+        parsed.push(e)
+      } catch { /* skip */ }
+    }
+
+    res.json({ ok: true, logs: parsed.reverse().slice(0, limit), total: parsed.length })
+  } catch (err) {
+    res.status(500).json({ ok: false, error: 'Could not read logs' })
+  }
+})
+
+app.delete('/api/logs', requireAdminToken, (req, res) => {
+  try {
+    const logFile = path.join(LOG_DIR, 'security.log')
+    if (fs.existsSync(logFile)) {
+      fs.copyFileSync(logFile, logFile + '.bak')
+      fs.writeFileSync(logFile, '', 'utf-8')
+    }
+    res.json({ ok: true, message: 'Logs cleared' })
+  } catch (err) {
+    res.status(500).json({ ok: false, error: 'Could not clear logs' })
+  }
+})
+
+app.get('/api/stats', requireAdminToken, (req, res) => {
+  try {
+    const logFile = path.join(LOG_DIR, 'security.log')
+    if (!fs.existsSync(logFile)) return res.json({ ok: true, stats: { total:0, warn:0, error:0, events:{}, topIps:[], hourly:[] } })
+
+    const lines = fs.readFileSync(logFile, 'utf-8').trim().split('
+').filter(Boolean)
+    let total = 0, warn = 0, error = 0
+    const events = {}, ips = {}, byHour = {}
+
+    for (const line of lines) {
+      try {
+        const e = JSON.parse(line)
+        total++
+        if (e.level === 'WARN')  warn++
+        if (e.level === 'ERROR') error++
+        events[e.event] = (events[e.event] || 0) + 1
+        if (e.ip) ips[e.ip] = (ips[e.ip] || 0) + 1
+        const h = new Date(e.ts).getHours()
+        byHour[h] = (byHour[h] || 0) + 1
+      } catch { /* skip */ }
+    }
+
+    const topIps = Object.entries(ips).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([ip,count])=>({ip,count}))
+    const hourly = Array.from({length:24},(_,h)=>({h,count:byHour[h]||0}))
+
+    res.json({ ok: true, stats: { total, warn, error, events, topIps, hourly } })
+  } catch (err) {
+    res.status(500).json({ ok: false, error: 'Could not compute stats' })
+  }
+})
+
 // ── Start ───────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', async () => {
   console.log(`\n${'═'.repeat(54)}`)
