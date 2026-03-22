@@ -476,18 +476,29 @@ app.get('/api/download', async (req, res) => {
         ...ya1, '-x', '--audio-format', 'mp3', '--audio-quality', `${q}k`,
         '--no-playlist', '--no-warnings', '--no-check-certificate',
         '-o', outTemplate, url
-      ], { timeout: 180000, maxBuffer: 10 * 1024 * 1024 })
+      ], { timeout: 300000, maxBuffer: 50 * 1024 * 1024 })
       outFile = path.join(TMP_DIR, `${jobId}.mp3`)
     } else {
+      // Broader format fallback chain — works across YouTube, TikTok, Instagram etc.
       const fmtStr = safeQuality === 'best'
-        ? 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best'
-        : `bestvideo[height<=${safeQuality}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${safeQuality}]+bestaudio/best[height<=${safeQuality}]`
+        ? 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/bestvideo+bestaudio/best'
+        : [
+            `bestvideo[height<=${safeQuality}][ext=mp4]+bestaudio[ext=m4a]`,
+            `bestvideo[height<=${safeQuality}][ext=mp4]+bestaudio`,
+            `bestvideo[height<=${safeQuality}]+bestaudio`,
+            `best[height<=${safeQuality}]`,
+            'best',
+          ].join('/')
       const [yb2,...ya2] = ytDlp.split(' ')
       await runCmd(yb2, [
-        ...ya2, '-f', fmtStr, '--merge-output-format', 'mp4',
+        ...ya2,
+        '-f', fmtStr,
+        '--merge-output-format', 'mp4',
         '--no-playlist', '--no-warnings', '--no-check-certificate',
-        '-o', outTemplate, url
-      ], { timeout: 300000, maxBuffer: 10 * 1024 * 1024 })
+        '--no-part',                          // no .part temp files
+        '--ffmpeg-location', '/usr/bin/ffmpeg', // explicit ffmpeg path in Docker
+        '-o', outTemplate, url,
+      ], { timeout: 600000, maxBuffer: 100 * 1024 * 1024 })  // 10 min, 100MB buffer
       outFile = path.join(TMP_DIR, `${jobId}.mp4`)
     }
 
