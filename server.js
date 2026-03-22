@@ -890,6 +890,130 @@ app.get('/api/stats', requireAdminToken, (req, res) => {
   }
 })
 
+// ── POST /api/playlist — fetch playlist metadata ────────────────
+app.post('/api/playlist', async (req, res) => {
+  const { url } = req.body
+  if (!url) return res.status(400).json({ error: 'URL is required' })
+  if (!isValidHttpUrl(url)) return res.status(400).json({ error: 'Invalid or unsafe URL' })
+
+  const isPlaylist = url.includes('list=') || url.includes('/playlist') || url.includes('/@') || url.includes('/channel')
+  if (!isPlaylist) return res.status(400).json({ error: 'Không phải link playlist. Dùng /api/info cho video đơn.' })
+
+  try {
+    const ytDlp = await getYtDlp()
+    const [ytBin, ...ytArgs] = ytDlp.split(' ')
+    const { stdout } = await runCmd(ytBin, [
+      ...ytArgs,
+      '--flat-playlist', '--dump-json', '--no-warnings', '--no-check-certificate',
+      '--playlist-end', '200', // max 200 videos
+      url
+    ], { timeout: 60000, maxBuffer: 50 * 1024 * 1024 })
+
+    const lines = stdout.trim().split('\n').filter(Boolean)
+    const items = []
+    for (const line of lines) {
+      try {
+        const v = JSON.parse(line)
+        items.push({
+          id:       v.id,
+          title:    v.title || v.id,
+          duration: v.duration ? `${Math.floor(v.duration/60)}:${String(v.duration%60).padStart(2,'0')}` : '',
+          thumb:    v.thumbnail || v.thumbnails?.[0]?.url || '',
+          url:      v.url || v.webpage_url || `https://www.youtube.com/watch?v=${v.id}`,
+        })
+      } catch {}
+    }
+
+    if (!items.length) return res.status(400).json({ error: 'Không tìm thấy video trong playlist' })
+
+    res.json({ ok: true, total: items.length, items })
+  } catch (err) {
+    secLog('ERROR', 'PLAYLIST_FAIL', { ip: req.ip, msg: err.message.slice(0, 200) })
+    res.status(500).json({ error: 'Không thể đọc playlist. Kiểm tra link có đúng không.' })
+  }
+})
+
+// ── POST /api/batch-info — fetch multiple URLs info ──────────────
+app.post('/api/batch-info', async (req, res) => {
+  const { urls } = req.body
+  if (!Array.isArray(urls) || !urls.length) return res.status(400).json({ error: 'urls array required' })
+  const safeUrls = urls.filter(u => u && isValidHttpUrl(u)).slice(0, 20) // max 20
+  if (!safeUrls.length) return res.status(400).json({ error: 'No valid URLs' })
+
+  const BASE = `${req.protocol}://${req.get('host')}`
+  const results = []
+
+  for (const url of safeUrls) {
+    try {
+      const ytDlp = await getYtDlp()
+      const [ytBin, ...ytArgs] = ytDlp.split(' ')
+      const { stdout } = await runCmd(ytBin, [
+        ...ytArgs, '--dump-json', '--no-playlist', '--no-warnings', '--no-check-certificate',
+        ...getPlatformArgs(url), url
+      ], { timeout: 20000 })
+      const info = JSON.parse(stdout.trim().split('\n')[0])
+      const enc  = encodeURIComponent(url)
+      results.push({
+        url, ok: true,
+        title:    info.title || 'Video',
+        thumb:    info.thumbnail || '',
+        duration: info.duration ? `${Math.floor(info.duration/60)}:${String(info.duration%60).padStart(2,'0')}` : '',
+        platform: detectPlatform(url),
+        mp3Url:   `${BASE}/api/download?url=${enc}&format=mp3&quality=320`,
+        mp4Url:   `${BASE}/api/download?url=${enc}&format=mp4&quality=1080`,
+      })
+    } catch (err) {
+      results.push({ url, ok: false, error: 'Không tải được video này' })
+    }
+  }
+
+  res.json({ ok: true, results })
+})
+
+// ── GET /api/subtitle — download subtitle ────────────────────────
+app.get('/api/subtitle', async (req, res) => {
+  const { url, lang = 'vi,en', fmt = 'srt' } = req.query
+  if (!url) return res.status(400).json({ error: 'URL required' })
+  if (!isValidHttpUrl(url)) return res.status(400).json({ error: 'Invalid URL' })
+
+  const jobId  = uuidv4()
+  const outDir = TMP_DIR
+  const safeFormat = ['srt','vtt','ass','json3'].includes(fmt) ? fmt : 'srt'
+
+  try {
+    const ytDlp = await getYtDlp()
+    const [ytBin, ...ytArgs] = ytDlp.split(' ')
+
+    await runCmd(ytBin, [
+      ...ytArgs,
+      '--write-subs', '--write-auto-subs',
+      '--sub-langs', lang,
+      '--sub-format', safeFormat,
+      '--skip-download',
+      '--no-warnings', '--no-check-certificate',
+      '-o', path.join(outDir, `${jobId}.%(ext)s`),
+      url
+    ], { timeout: 30000, maxBuffer: 10 * 1024 * 1024 })
+
+    // Find the subtitle file
+    const files = fs.readdirSync(outDir).filter(f => f.startsWith(jobId) && !f.endsWith('.mp3') && !f.endsWith('.mp4'))
+    if (!files.length) return res.status(404).json({ error: 'Không tìm thấy phụ đề cho video này' })
+
+    const subFile = path.join(outDir, files[0])
+    const ext     = path.extname(files[0]).slice(1)
+    const mimeTypes = { srt: 'text/plain', vtt: 'text/vtt', ass: 'text/plain', json3: 'application/json' }
+
+    res.setHeader('Content-Type', mimeTypes[ext] || 'text/plain')
+    res.setHeader('Content-Disposition', `attachment; filename="subtitle.${ext}"`)
+    const stream = fs.createReadStream(subFile)
+    stream.pipe(res)
+    stream.on('end', () => setTimeout(() => deleteFiles(subFile), 30000))
+  } catch (err) {
+    secLog('ERROR', 'SUBTITLE_FAIL', { ip: req.ip, msg: err.message.slice(0, 100) })
+    res.status(500).json({ error: 'Không tải được phụ đề. Video có thể không có phụ đề.' })
+  }
+})
+
 // ── Start ───────────────────────────────────────────────────────
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n${'═'.repeat(54)}`)
