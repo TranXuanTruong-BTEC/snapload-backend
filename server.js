@@ -966,9 +966,7 @@ app.post('/api/tag', async (req, res) => {
     : (sanitizeQuality(quality, ['2160','1080','720','480']))
 
   // Sanitize tag values — no shell injection
-  function sanitizeTag(v) { return String(v || '').replace(/["\
-
-]/g, '').slice(0, 200) }
+  function sanitizeTag(v) { return String(v || '').replace(/["\\]/g, '').slice(0, 200) }
   const tags = {
     title:  sanitizeTag(title),
     artist: sanitizeTag(artist),
