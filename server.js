@@ -871,13 +871,17 @@ app.post('/api/playlist', async (req, res) => {
   const isPlaylist = url.includes('list=') || url.includes('/playlist') || url.includes('/@') || url.includes('/channel')
   if (!isPlaylist) return res.status(400).json({ error: 'Không phải link playlist. Dùng /api/info cho video đơn.' })
 
+  // Allow configurable max items (from admin config, default 200, max 500)
+  const rawMax  = parseInt(req.body.maxItems || req.query.maxItems || '200')
+  const maxItems = Math.min(Math.max(rawMax, 10), 500)
+
   try {
     const ytDlp = await getYtDlp()
     const [ytBin, ...ytArgs] = ytDlp.split(' ')
     const { stdout } = await runCmd(ytBin, [
       ...ytArgs,
       '--flat-playlist', '--dump-json', '--no-warnings', '--no-check-certificate',
-      '--playlist-end', '200', // max 200 videos
+      '--playlist-end', String(maxItems), // configurable max
       url
     ], { timeout: 60000, maxBuffer: 50 * 1024 * 1024 })
 
@@ -971,7 +975,8 @@ app.post('/api/tag', async (req, res) => {
 
   // Sanitize tag values — no shell injection
   function sanitizeTag(v) { return String(v || '').replace(/["\
-]/g, '').slice(0, 200) }
+
+]/g, '').slice(0, 200) }
   const tags = {
     title:  sanitizeTag(title),
     artist: sanitizeTag(artist),
