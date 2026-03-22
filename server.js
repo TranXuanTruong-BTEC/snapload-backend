@@ -276,7 +276,7 @@ function sanitizeQuality(q, allowed) {
 // ── Helpers ─────────────────────────────────────────────────────
 function detectPlatform(url) {
   const map = [
-    ['youtu', 'YouTube'], ['tiktok', 'TikTok'], ['instagram', 'Instagram'],
+    ['tiktok', 'TikTok'], ['instagram', 'Instagram'],
     ['facebook', 'Facebook'], ['twitter', 'Twitter/X'], ['x.com', 'Twitter/X'],
     ['reddit', 'Reddit'], ['vimeo', 'Vimeo'],
   ]
@@ -330,6 +330,12 @@ app.post('/api/info', async (req, res) => {
   if (!isValidHttpUrl(url)) {
     secLog('WARN', 'INVALID_URL', { ip: req.ip, url: url.slice(0, 120) })
     return res.status(400).json({ error: 'Invalid or unsafe URL' })
+  }
+
+  // Block specific platforms (DMCA compliance)
+  if (/youtube\.com|youtu\.be|yt\.be/i.test(url)) {
+    secLog('WARN', 'BLOCKED_PLATFORM', { ip: req.ip, reason: 'DMCA' })
+    return res.status(451).json({ error: 'This platform is not supported on the web version.' })
   }
 
   try {
@@ -882,10 +888,10 @@ app.post('/api/playlist', async (req, res) => {
     for (const line of lines) {
       try {
         const v = JSON.parse(line)
-        // Normalize to full YouTube URL
+        // Normalize to full URL
         let videoUrl = v.webpage_url || v.url || ''
-        if (!videoUrl.startsWith('http')) {
-          videoUrl = `https://www.youtube.com/watch?v=${v.id}`
+        if (!videoUrl.startsWith('http') && v.id) {
+          videoUrl = `https://www.tiktok.com/video/${v.id}`
         }
         // Remove any double-encoding
         try { videoUrl = decodeURIComponent(videoUrl) } catch {}
