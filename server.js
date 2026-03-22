@@ -572,8 +572,7 @@ app.get('/api/logs', requireAdminToken, (req, res) => {
     const limit = Math.min(parseInt(req.query.limit || '200'), 500)
     const level = req.query.level || ''
 
-    const lines  = fs.readFileSync(logFile, 'utf-8').trim().split('
-').filter(Boolean)
+    const lines  = fs.readFileSync(logFile, 'utf-8').trim().split('\n').filter(Boolean)
     const parsed = []
     for (const line of lines) {
       try {
@@ -607,8 +606,7 @@ app.get('/api/stats', requireAdminToken, (req, res) => {
     const logFile = path.join(LOG_DIR, 'security.log')
     if (!fs.existsSync(logFile)) return res.json({ ok: true, stats: { total:0, warn:0, error:0, events:{}, topIps:[], hourly:[] } })
 
-    const lines = fs.readFileSync(logFile, 'utf-8').trim().split('
-').filter(Boolean)
+    const lines = fs.readFileSync(logFile, 'utf-8').trim().split('\n').filter(Boolean)
     let total = 0, warn = 0, error = 0
     const events = {}, ips = {}, byHour = {}
 

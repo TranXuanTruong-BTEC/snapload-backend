@@ -28,8 +28,4 @@ RUN mkdir -p /app/tmp /app/logs
 ENV PORT=4000
 EXPOSE 4000
 
-# Docker healthcheck — use curl (already installed above)
-HEALTHCHECK --interval=15s --timeout=10s --start-period=20s --retries=5 \
-  CMD curl -sf http://localhost:${PORT:-4000}/api/health > /dev/null || exit 1
-
 CMD ["node", "server.js"]
