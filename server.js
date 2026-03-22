@@ -183,34 +183,6 @@ function checkRateLimit(ip, endpoint, max) {
   return cnt > max
 }
 
-// ── IP Block middleware ───────────────────────────────────────
-app.use((req, res, next) => {
-  const ip = req.ip || req.connection.remoteAddress || 'unknown'
-  if (_db.blockedIPs.includes(ip)) {
-    secLog('WARN', 'BLOCKED_IP', { ip, path: req.path })
-    return res.status(403).json({ error: 'Access denied' })
-  }
-  next()
-})
-
-// ── Visitor tracking middleware ───────────────────────────────
-app.use((req, res, next) => {
-  // Only track meaningful endpoints, skip static/health spam
-  const track = ['/api/info', '/api/download', '/api/convert', '/api/health']
-  if (track.some(p => req.path.startsWith(p))) {
-    const entry = {
-      ts:   new Date().toISOString(),
-      ip:   req.ip || 'unknown',
-      path: req.path,
-      ua:   (req.headers['user-agent'] || '').slice(0, 120),
-      ref:  (req.headers['referer']    || '').slice(0, 80),
-    }
-    visitors.push(entry)
-    if (visitors.length > MAX_VISITORS) visitors.splice(0, visitors.length - MAX_VISITORS)
-  }
-  next()
-})
-
 app.use((req, res, next) => {
   const ip  = req.ip || 'unknown'
   const ua  = req.headers['user-agent'] || ''
@@ -312,38 +284,6 @@ function detectPlatform(url) {
   return 'Web'
 }
 
-// Platform-specific yt-dlp extra args
-function getPlatformArgs(url) {
-  const u = url.toLowerCase()
-  const args = []
-
-  // Instagram: needs user-agent + extra headers to avoid 401
-  if (u.includes('instagram.com')) {
-    args.push(
-      '--add-header', 'User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
-      '--add-header', 'Accept-Language:en-US,en;q=0.9',
-    )
-  }
-
-  // TikTok: needs referer
-  if (u.includes('tiktok.com')) {
-    args.push(
-      '--add-header', 'Referer:https://www.tiktok.com/',
-      '--add-header', 'User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    )
-  }
-
-  // Twitter/X: use API extractor
-  if (u.includes('twitter.com') || u.includes('x.com')) {
-    args.push('--extractor-args', 'twitter:api=legacy')
-  }
-
-  // All: rotate user-agent for better compatibility
-  args.push('--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-
-  return args
-}
-
 function cleanTmp() {
   try {
     const MAX_AGE = 30 * 60 * 1000
@@ -397,9 +337,7 @@ app.post('/api/info', async (req, res) => {
     const [ytBin, ...ytArgs] = ytDlp.split(' ')
     const { stdout } = await runCmd(ytBin, [
       ...ytArgs,
-      '--dump-json', '--no-playlist', '--no-warnings', '--no-check-certificate',
-      ...getPlatformArgs(url),
-      url
+      '--dump-json', '--no-playlist', '--no-warnings', '--no-check-certificate', url
     ], { timeout: 30000 })
 
     const info     = JSON.parse(stdout.trim().split('\n')[0])
@@ -480,30 +418,20 @@ app.get('/api/download', async (req, res) => {
     : sanitizeQuality(quality, ['2160','1080','720','480','best'])
   const safeFormat = ['mp3','mp4'].includes(format) ? format : 'mp3'
 
-  // iOS opens URL directly in new tab — don't block with concurrent limit
-  // (iOS streams inline, doesn't hold a long connection like desktop)
-  const dlUa  = req.headers['user-agent'] || ''
-  const dlIsIOS = /iPad|iPhone|iPod/i.test(dlUa) ||
-                  (dlUa.includes('Mac') && /like iPhone/.test(dlUa))
-
+  // Enforce concurrent job limit per IP
   const dlIp = req.ip || 'unknown'
-
   const runningJobs = activeJobs.get(dlIp) || 0
-  if (!dlIsIOS) {
-    // Only enforce concurrent limit for non-iOS (Android/Desktop hold connections)
-    if (runningJobs >= MAX_CONCURRENT) {
-      secLog('WARN', 'CONCURRENT_LIMIT', { ip: dlIp })
-      return res.status(429).json({ error: 'Too many concurrent downloads. Please wait for the current one to finish.' })
-    }
-    activeJobs.set(dlIp, runningJobs + 1)
+  if (runningJobs >= MAX_CONCURRENT) {
+    secLog('WARN', 'CONCURRENT_LIMIT', { ip: dlIp })
+    return res.status(429).json({ error: 'Too many concurrent downloads. Please wait for the current one to finish.' })
   }
+  activeJobs.set(dlIp, runningJobs + 1)
 
   const jobId = uuidv4()
   const outTemplate = path.join(TMP_DIR, `${jobId}.%(ext)s`)
   let outFile = null
 
   const releaseJob = () => {
-    if (dlIsIOS) return  // iOS was never counted
     const cur = activeJobs.get(dlIp) || 1
     if (cur <= 1) activeJobs.delete(dlIp)
     else activeJobs.set(dlIp, cur - 1)
@@ -519,32 +447,19 @@ app.get('/api/download', async (req, res) => {
       await runCmd(yb1, [
         ...ya1, '-x', '--audio-format', 'mp3', '--audio-quality', `${q}k`,
         '--no-playlist', '--no-warnings', '--no-check-certificate',
-        ...getPlatformArgs(url),
         '-o', outTemplate, url
-      ], { timeout: 300000, maxBuffer: 50 * 1024 * 1024 })
+      ], { timeout: 180000, maxBuffer: 10 * 1024 * 1024 })
       outFile = path.join(TMP_DIR, `${jobId}.mp3`)
     } else {
-      // Broader format fallback chain — works across YouTube, TikTok, Instagram etc.
       const fmtStr = safeQuality === 'best'
-        ? 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/bestvideo+bestaudio/best'
-        : [
-            `bestvideo[height<=${safeQuality}][ext=mp4]+bestaudio[ext=m4a]`,
-            `bestvideo[height<=${safeQuality}][ext=mp4]+bestaudio`,
-            `bestvideo[height<=${safeQuality}]+bestaudio`,
-            `best[height<=${safeQuality}]`,
-            'best',
-          ].join('/')
+        ? 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best'
+        : `bestvideo[height<=${safeQuality}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${safeQuality}]+bestaudio/best[height<=${safeQuality}]`
       const [yb2,...ya2] = ytDlp.split(' ')
       await runCmd(yb2, [
-        ...ya2,
-        '-f', fmtStr,
-        '--merge-output-format', 'mp4',
+        ...ya2, '-f', fmtStr, '--merge-output-format', 'mp4',
         '--no-playlist', '--no-warnings', '--no-check-certificate',
-        '--no-part',
-        '--ffmpeg-location', '/usr/bin/ffmpeg',
-        ...getPlatformArgs(url),
-        '-o', outTemplate, url,
-      ], { timeout: 600000, maxBuffer: 100 * 1024 * 1024 })
+        '-o', outTemplate, url
+      ], { timeout: 300000, maxBuffer: 10 * 1024 * 1024 })
       outFile = path.join(TMP_DIR, `${jobId}.mp4`)
     }
 
@@ -559,30 +474,10 @@ app.get('/api/download', async (req, res) => {
     const mimeType = ext === 'mp3' ? 'audio/mpeg' : 'video/mp4'
     const size     = fs.statSync(outFile).size
 
-    // ── Mobile-aware headers ──────────────────────────────────
-    // iOS Safari needs Content-Type without attachment to show native player
-    // Android/Desktop gets attachment for direct save
-    const ua        = req.headers['user-agent'] || ''
-    const isIOS     = /iPad|iPhone|iPod/i.test(ua) ||
-                      (ua.includes('Mac') && /like iPhone/.test(ua))
-    const safeTitle = (req.query.title || 'snapload')
-                        .replace(/[^\w\s.-]/g, '').trim().slice(0, 60) || 'snapload'
-    const dlName    = `${safeTitle}.${ext}`
-
     res.setHeader('Content-Type', mimeType)
-    res.setHeader('Accept-Ranges', 'bytes')
+    res.setHeader('Content-Disposition', `attachment; filename="snapload.${ext}"`)
     res.setHeader('Content-Length', size)
     res.setHeader('X-File-Size', size)
-    res.setHeader('Cache-Control', 'no-cache, no-store')
-    res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Disposition, X-File-Size')
-
-    if (isIOS) {
-      // iOS: inline so Safari can show native controls + Download button
-      res.setHeader('Content-Disposition', `inline; filename="${dlName}"`)
-    } else {
-      // Android + Desktop: force-download to Downloads folder
-      res.setHeader('Content-Disposition', `attachment; filename="${dlName}"; filename*=UTF-8''${encodeURIComponent(dlName)}`)
-    }
 
     const stream = fs.createReadStream(outFile)
     stream.pipe(res)
@@ -682,24 +577,93 @@ app.get('/api/download-converted/:filename', (req, res) => {
   // Only serve .mp3 files from this endpoint
   if (!safe.endsWith('.mp3')) return res.status(400).json({ error: 'Invalid file type' })
   res.setHeader('Content-Type', 'audio/mpeg')
-  res.setHeader('Accept-Ranges', 'bytes')
-  res.setHeader('Cache-Control', 'no-cache, no-store')
-  res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Disposition, X-File-Size')
-  const ua2 = req.headers['user-agent'] || ''
-  const isIOS2 = /iPad|iPhone|iPod/i.test(ua2)
-  const safeDlName = (name || 'snapload').replace(/[^\w\s.-]/g, '').slice(0, 100) + '.mp3'
-  const fileSize2 = fs.statSync(filePath).size
-  res.setHeader('Content-Length', fileSize2)
-  res.setHeader('X-File-Size', fileSize2)
-  if (isIOS2) {
-    res.setHeader('Content-Disposition', `inline; filename="${safeDlName}"`)
-  } else {
-    res.setHeader('Content-Disposition', `attachment; filename="${safeDlName}"; filename*=UTF-8''${encodeURIComponent(safeDlName)}`)
-  }
+  const safeDlName = name.replace(/[^\w\s.-]/g, '').slice(0, 100) + '.mp3'
+  res.setHeader('Content-Disposition', `attachment; filename="${safeDlName}"`)
+  res.setHeader('Content-Length', fs.statSync(filePath).size)
 
   const stream = fs.createReadStream(filePath)
   stream.pipe(res)
   stream.on('end', () => setTimeout(() => deleteFiles(filePath), 10000))
+})
+
+// ── GET /api/logs — read log (admin only via ADMIN_TOKEN) ──────
+const BACKEND_ADMIN_TOKEN = process.env.ADMIN_TOKEN || null
+
+function requireAdminToken(req, res, next) {
+  if (!BACKEND_ADMIN_TOKEN) return next() // no token set = open (local dev only)
+  const token = req.headers['x-admin-token'] || req.query.token
+  if (token !== BACKEND_ADMIN_TOKEN) {
+    return res.status(401).json({ error: 'Unauthorized' })
+  }
+  next()
+}
+
+app.get('/api/logs', requireAdminToken, (req, res) => {
+  try {
+    const logFile = path.join(LOG_DIR, 'security.log')
+    if (!fs.existsSync(logFile)) return res.json({ ok: true, logs: [], total: 0 })
+
+    const limit = Math.min(parseInt(req.query.limit || '200'), 500)
+    const level = req.query.level || ''
+
+    const lines  = fs.readFileSync(logFile, 'utf-8').trim().split('\n').filter(Boolean)
+    const parsed = []
+    for (const line of lines) {
+      try {
+        const e = JSON.parse(line)
+        if (level && e.level !== level) continue
+        parsed.push(e)
+      } catch { /* skip */ }
+    }
+
+    res.json({ ok: true, logs: parsed.reverse().slice(0, limit), total: parsed.length })
+  } catch (err) {
+    res.status(500).json({ ok: false, error: 'Could not read logs' })
+  }
+})
+
+app.delete('/api/logs', requireAdminToken, (req, res) => {
+  try {
+    const logFile = path.join(LOG_DIR, 'security.log')
+    if (fs.existsSync(logFile)) {
+      fs.copyFileSync(logFile, logFile + '.bak')
+      fs.writeFileSync(logFile, '', 'utf-8')
+    }
+    res.json({ ok: true, message: 'Logs cleared' })
+  } catch (err) {
+    res.status(500).json({ ok: false, error: 'Could not clear logs' })
+  }
+})
+
+app.get('/api/stats', requireAdminToken, (req, res) => {
+  try {
+    const logFile = path.join(LOG_DIR, 'security.log')
+    if (!fs.existsSync(logFile)) return res.json({ ok: true, stats: { total:0, warn:0, error:0, events:{}, topIps:[], hourly:[] } })
+
+    const lines = fs.readFileSync(logFile, 'utf-8').trim().split('\n').filter(Boolean)
+    let total = 0, warn = 0, error = 0
+    const events = {}, ips = {}, byHour = {}
+
+    for (const line of lines) {
+      try {
+        const e = JSON.parse(line)
+        total++
+        if (e.level === 'WARN')  warn++
+        if (e.level === 'ERROR') error++
+        events[e.event] = (events[e.event] || 0) + 1
+        if (e.ip) ips[e.ip] = (ips[e.ip] || 0) + 1
+        const h = new Date(e.ts).getHours()
+        byHour[h] = (byHour[h] || 0) + 1
+      } catch { /* skip */ }
+    }
+
+    const topIps = Object.entries(ips).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([ip,count])=>({ip,count}))
+    const hourly = Array.from({length:24},(_,h)=>({h,count:byHour[h]||0}))
+
+    res.json({ ok: true, stats: { total, warn, error, events, topIps, hourly } })
+  } catch (err) {
+    res.status(500).json({ ok: false, error: 'Could not compute stats' })
+  }
 })
 
 // ── POST /api/pageview — lightweight page view ping (public) ──
