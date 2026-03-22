@@ -784,8 +784,6 @@ app.delete('/api/feedback/:id', requireAdminToken, (req, res) => {
   res.json({ ok: true })
 })
 
-// ── GET /api/logs — read log (admin only via ADMIN_TOKEN) ──────
-const BACKEND_ADMIN_TOKEN = process.env.ADMIN_TOKEN || null
 
 function requireAdminToken(req, res, next) {
   if (!BACKEND_ADMIN_TOKEN) return next() // no token set = open (local dev only)
@@ -950,104 +948,6 @@ app.post('/api/batch-info', async (req, res) => {
   }
 
   res.json({ ok: true, results })
-})
-
-// ── POST /api/playlist-zip — sequential server-side processing ──
-// Uses Node.js built-in zlib to create ZIP without external deps
-app.post('/api/playlist-zip', async (req, res) => {
-  const { urls, format = 'mp3', quality = '320', title = 'playlist' } = req.body
-  if (!Array.isArray(urls) || !urls.length) return res.status(400).json({ error: 'urls array required' })
-  const safeUrls    = urls.filter(u => u && isValidHttpUrl(u)).slice(0, 30)
-  const safeFormat  = ['mp3','mp4'].includes(format) ? format : 'mp3'
-  const safeQuality = safeFormat === 'mp3'
-    ? (['320','256','192','128'].includes(String(quality)) ? String(quality) : '320')
-    : (['2160','1080','720','480'].includes(String(quality)) ? String(quality) : '1080')
-
-  if (!safeUrls.length) return res.status(400).json({ error: 'No valid URLs' })
-
-  const jobId  = uuidv4()
-  const jobDir = path.join(TMP_DIR, `zip_${jobId}`)
-  fs.mkdirSync(jobDir, { recursive: true })
-
-  const safeTitle = (title || 'playlist').replace(/[^\w\s-]/g, '').trim().slice(0, 40)
-  secLog('INFO', 'ZIP_START', { ip: req.ip, count: safeUrls.length, format: safeFormat })
-
-  // Download all files sequentially
-  const downloadedFiles = []
-  const ytDlp = await getYtDlp()
-
-  for (let i = 0; i < safeUrls.length; i++) {
-    const url    = safeUrls[i]
-    const fileId = `${String(i+1).padStart(3,'0')}_${uuidv4().slice(0,6)}`
-    const outTpl = path.join(jobDir, `${fileId}.%(ext)s`)
-    try {
-      const [ytBin, ...ytArgs] = ytDlp.split(' ')
-      if (safeFormat === 'mp3') {
-        await runCmd(ytBin, [
-          ...ytArgs, '-x', '--audio-format', 'mp3',
-          '--audio-quality', `${safeQuality}k`,
-          '--no-playlist', '--no-warnings', '--no-check-certificate',
-          ...getPlatformArgs(url), '-o', outTpl, url,
-        ], { timeout: 300000, maxBuffer: 50 * 1024 * 1024 })
-      } else {
-        const fmtStr = [
-          `bestvideo[height<=${safeQuality}][ext=mp4]+bestaudio[ext=m4a]`,
-          `bestvideo[height<=${safeQuality}]+bestaudio`, `best[height<=${safeQuality}]`, 'best',
-        ].join('/')
-        await runCmd(ytBin, [
-          ...ytArgs, '-f', fmtStr, '--merge-output-format', 'mp4',
-          '--no-playlist', '--no-warnings', '--no-check-certificate',
-          '--no-part', '--ffmpeg-location', '/usr/bin/ffmpeg',
-          ...getPlatformArgs(url), '-o', outTpl, url,
-        ], { timeout: 600000, maxBuffer: 100 * 1024 * 1024 })
-      }
-      const files = fs.readdirSync(jobDir).filter(f => f.startsWith(fileId))
-      if (files.length) downloadedFiles.push(path.join(jobDir, files[0]))
-    } catch (err) {
-      secLog('WARN', 'ZIP_ITEM_FAIL', { url: url.slice(0,80), msg: err.message.slice(0,100) })
-    }
-  }
-
-  if (!downloadedFiles.length) {
-    fs.rmSync(jobDir, { recursive: true, force: true })
-    return res.status(500).json({ error: 'Không tải được video nào' })
-  }
-
-  // Build ZIP using only built-in modules (no archiver needed)
-  // Simple approach: write a ZIP file manually using Node's zlib
-  const zipPath = path.join(TMP_DIR, `${jobId}.zip`)
-
-  // Use 'zip' command if available (Linux/Docker), otherwise stream files
-  try {
-    await runCmd('zip', ['-j', zipPath, ...downloadedFiles], { timeout: 60000, maxBuffer: 10 * 1024 * 1024, shell: false })
-
-    const stat = fs.statSync(zipPath)
-    res.setHeader('Content-Type', 'application/zip')
-    res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.zip"`)
-    res.setHeader('Content-Length', String(stat.size))
-
-    const stream = fs.createReadStream(zipPath)
-    stream.pipe(res)
-    stream.on('end', () => {
-      setTimeout(() => {
-        try { fs.rmSync(jobDir, { recursive: true, force: true }); fs.unlinkSync(zipPath) } catch {}
-      }, 60000)
-    })
-    secLog('INFO', 'ZIP_DONE', { ip: req.ip, files: downloadedFiles.length })
-  } catch {
-    // zip command not available — send files as multipart or fallback to first file
-    secLog('WARN', 'ZIP_CMD_FAIL', { ip: req.ip })
-    // Fallback: stream the first file
-    const firstFile = downloadedFiles[0]
-    const ext = path.extname(firstFile)
-    res.setHeader('Content-Type', safeFormat === 'mp3' ? 'audio/mpeg' : 'video/mp4')
-    res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}${ext}"`)
-    const stream = fs.createReadStream(firstFile)
-    stream.pipe(res)
-    stream.on('end', () => {
-      setTimeout(() => { try { fs.rmSync(jobDir, { recursive: true, force: true }) } catch {} }, 30000)
-    })
-  }
 })
 
 // ── GET /api/subtitle-zip-status — SSE progress stream ──────────
