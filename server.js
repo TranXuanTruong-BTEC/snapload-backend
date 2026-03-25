@@ -454,18 +454,20 @@ app.get('/api/download', async (req, res) => {
         ...ya1, '-x', '--audio-format', 'mp3', '--audio-quality', `${q}k`,
         '--no-playlist', '--no-warnings', '--no-check-certificate',
         '-o', outTemplate, url
-      ], { timeout: 180000, maxBuffer: 10 * 1024 * 1024 })
+      ], { timeout: 180000, maxBuffer: 50 * 1024 * 1024 })
       outFile = path.join(TMP_DIR, `${jobId}.mp3`)
     } else {
+      // Format fallback chain — từ tốt nhất → đơn giản nhất
+      // Nhiều platform (TikTok, FB, IG) chỉ có single stream, không có ext=mp4 riêng
       const fmtStr = safeQuality === 'best'
-        ? 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best'
-        : `bestvideo[height<=${safeQuality}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${safeQuality}]+bestaudio/best[height<=${safeQuality}]`
+        ? 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/bestvideo+bestaudio/best[ext=mp4]/best'
+        : `bestvideo[height<=${safeQuality}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${safeQuality}][ext=mp4]+bestaudio/bestvideo[height<=${safeQuality}]+bestaudio/best[height<=${safeQuality}][ext=mp4]/best[height<=${safeQuality}]/best`
       const [yb2,...ya2] = ytDlp.split(' ')
       await runCmd(yb2, [
         ...ya2, '-f', fmtStr, '--merge-output-format', 'mp4',
         '--no-playlist', '--no-warnings', '--no-check-certificate',
         '-o', outTemplate, url
-      ], { timeout: 300000, maxBuffer: 10 * 1024 * 1024 })
+      ], { timeout: 300000, maxBuffer: 50 * 1024 * 1024 })
       outFile = path.join(TMP_DIR, `${jobId}.mp4`)
     }
 
@@ -500,7 +502,12 @@ app.get('/api/download', async (req, res) => {
 
   } catch (err) {
     releaseJob()
-    secLog('ERROR', 'DOWNLOAD_FAIL', { ip: dlIp, msg: err.message.slice(0, 200) })
+    // execFile errors có err.stderr chứa output thực của yt-dlp
+    // err.message chứa toàn bộ command string — quá dài để log
+    const errDetail = err.stderr
+      ? err.stderr.trim().split('\n').filter(l => l.includes('ERROR') || l.includes('error')).slice(0,3).join(' | ')
+      : err.message.slice(0, 300)
+    secLog('ERROR', 'DOWNLOAD_FAIL', { ip: dlIp, msg: errDetail || err.message.slice(0, 200) })
     fs.readdirSync(TMP_DIR).filter(f => f.startsWith(jobId)).forEach(f =>
       deleteFiles(path.join(TMP_DIR, f))
     )
