@@ -174,6 +174,8 @@ app.use(cors({
   },
   methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-token'],
+  // Expose download headers — Android/mobile browser cần đọc các header này
+  exposedHeaders: ['Content-Disposition', 'Content-Length', 'Content-Type', 'X-File-Size', 'X-Filename'],
   credentials: true,
 }))
 
@@ -513,11 +515,15 @@ app.get('/api/download', async (req, res) => {
     const ext      = path.extname(outFile).slice(1)
     const mimeType = ext === 'mp3' ? 'audio/mpeg' : 'video/mp4'
     const size     = fs.statSync(outFile).size
+    const dlName   = `snapload.${ext}`
 
     res.setHeader('Content-Type', mimeType)
-    res.setHeader('Content-Disposition', `attachment; filename="snapload.${ext}"`)
+    // filename* (RFC 5987) cho Android Chrome đọc đúng tên file
+    res.setHeader('Content-Disposition', `attachment; filename="${dlName}"; filename*=UTF-8''${encodeURIComponent(dlName)}`)
     res.setHeader('Content-Length', size)
     res.setHeader('X-File-Size', size)
+    // X-Filename: frontend dùng để tải blob với đúng tên file
+    res.setHeader('X-Filename', dlName)
 
     const stream = fs.createReadStream(outFile)
     stream.pipe(res)
