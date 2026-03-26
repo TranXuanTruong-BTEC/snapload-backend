@@ -1131,7 +1131,7 @@ app.get('/api/subtitle', async (req, res) => {
       url
     ], { timeout: 30000, maxBuffer: 10 * 1024 * 1024 })
 
-    // Find the subtitle file
+    
     const files = fs.readdirSync(outDir).filter(f => f.startsWith(jobId) && !f.endsWith('.mp3') && !f.endsWith('.mp4'))
     if (!files.length) return res.status(404).json({ error: 'Không tìm thấy phụ đề cho video này' })
 
@@ -1150,7 +1150,7 @@ app.get('/api/subtitle', async (req, res) => {
   }
 })
 
-// ── Start ───────────────────────────────────────────────────────
+//  Start
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n${'═'.repeat(54)}`)
   console.log(`  🚀 SnapLoad Backend — listening on port ${PORT}`)
