@@ -20,6 +20,40 @@ const execFileAsync = promisify(execFile)
 async function runCmd(bin, args, opts = {}) {
   return execFileAsync(bin, args, { ...opts, shell: false })
 }
+
+// Platform-specific yt-dlp args for better compatibility
+function getPlatformArgs(url) {
+  const u = url.toLowerCase()
+  const args = []
+
+  if (u.includes('instagram.com')) {
+    // Instagram: Android UA works better than desktop — avoids login wall
+    args.push(
+      '--add-header', 'User-Agent:Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36',
+      '--add-header', 'Accept-Language:en-US,en;q=0.9',
+      '--add-header', 'Accept:text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    )
+  }
+
+  if (u.includes('tiktok.com')) {
+    args.push(
+      '--add-header', 'Referer:https://www.tiktok.com/',
+      '--add-header', 'User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    )
+  }
+
+  if (u.includes('twitter.com') || u.includes('x.com')) {
+    args.push('--extractor-args', 'twitter:api=legacy')
+  }
+
+  if (u.includes('facebook.com') || u.includes('fb.watch')) {
+    args.push(
+      '--add-header', 'User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    )
+  }
+
+  return args
+}
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 // ── Config ─────────────────────────────────────────────────────
@@ -454,20 +488,18 @@ app.get('/api/download', async (req, res) => {
         ...ya1, '-x', '--audio-format', 'mp3', '--audio-quality', `${q}k`,
         '--no-playlist', '--no-warnings', '--no-check-certificate',
         '-o', outTemplate, url
-      ], { timeout: 180000, maxBuffer: 50 * 1024 * 1024 })
+      ], { timeout: 180000, maxBuffer: 10 * 1024 * 1024 })
       outFile = path.join(TMP_DIR, `${jobId}.mp3`)
     } else {
-      // Format fallback chain — từ tốt nhất → đơn giản nhất
-      // Nhiều platform (TikTok, FB, IG) chỉ có single stream, không có ext=mp4 riêng
       const fmtStr = safeQuality === 'best'
-        ? 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/bestvideo+bestaudio/best[ext=mp4]/best'
-        : `bestvideo[height<=${safeQuality}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${safeQuality}][ext=mp4]+bestaudio/bestvideo[height<=${safeQuality}]+bestaudio/best[height<=${safeQuality}][ext=mp4]/best[height<=${safeQuality}]/best`
+        ? 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best'
+        : `bestvideo[height<=${safeQuality}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${safeQuality}]+bestaudio/best[height<=${safeQuality}]`
       const [yb2,...ya2] = ytDlp.split(' ')
       await runCmd(yb2, [
         ...ya2, '-f', fmtStr, '--merge-output-format', 'mp4',
         '--no-playlist', '--no-warnings', '--no-check-certificate',
         '-o', outTemplate, url
-      ], { timeout: 300000, maxBuffer: 50 * 1024 * 1024 })
+      ], { timeout: 300000, maxBuffer: 10 * 1024 * 1024 })
       outFile = path.join(TMP_DIR, `${jobId}.mp4`)
     }
 
@@ -502,12 +534,7 @@ app.get('/api/download', async (req, res) => {
 
   } catch (err) {
     releaseJob()
-    // execFile errors có err.stderr chứa output thực của yt-dlp
-    // err.message chứa toàn bộ command string — quá dài để log
-    const errDetail = err.stderr
-      ? err.stderr.trim().split('\n').filter(l => l.includes('ERROR') || l.includes('error')).slice(0,3).join(' | ')
-      : err.message.slice(0, 300)
-    secLog('ERROR', 'DOWNLOAD_FAIL', { ip: dlIp, msg: errDetail || err.message.slice(0, 200) })
+    secLog('ERROR', 'DOWNLOAD_FAIL', { ip: dlIp, msg: err.message.slice(0, 200) })
     fs.readdirSync(TMP_DIR).filter(f => f.startsWith(jobId)).forEach(f =>
       deleteFiles(path.join(TMP_DIR, f))
     )
