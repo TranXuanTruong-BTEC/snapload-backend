@@ -379,7 +379,8 @@ app.post('/api/info', async (req, res) => {
     const [ytBin, ...ytArgs] = ytDlp.split(' ')
     const { stdout } = await runCmd(ytBin, [
       ...ytArgs,
-      '--dump-json', '--no-playlist', '--no-warnings', '--no-check-certificate', url
+      '--dump-json', '--no-playlist', '--no-warnings', '--no-check-certificate',
+      ...getPlatformArgs(url), url
     ], { timeout: 30000 })
 
     const info     = JSON.parse(stdout.trim().split('\n')[0])
@@ -920,6 +921,7 @@ app.post('/api/playlist', async (req, res) => {
       ...ytArgs,
       '--flat-playlist', '--dump-json', '--no-warnings', '--no-check-certificate',
       '--playlist-end', String(maxItems), // configurable max
+      ...getPlatformArgs(url),
       url
     ], { timeout: 60000, maxBuffer: 50 * 1024 * 1024 })
 
