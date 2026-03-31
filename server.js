@@ -541,7 +541,39 @@ app.get('/api/download', async (req, res) => {
 
   } catch (err) {
     releaseJob()
-    secLog('ERROR', 'DOWNLOAD_FAIL', { ip: dlIp, msg: err.message.slice(0, 200) })
+
+    // err.stderr has the actual yt-dlp error message (e.g. "Login required", "HTTP Error 403")
+    // err.message is often just "Command failed: yt-dlp ..." — not useful on its own
+    const stderrRaw = (err.stderr || '').trim()
+    // Extract the most meaningful line from yt-dlp stderr output
+    // yt-dlp prints errors like: "ERROR: [Instagram] ...: Login required"
+    const stderrLines = stderrRaw.split('\n').filter(l => l.trim())
+    const errorLine = stderrLines.find(l => /ERROR|error|failed|login|private|unavailable|forbidden|403|404|429/i.test(l))
+      || stderrLines[stderrLines.length - 1]
+      || ''
+
+    // Detect platform from URL for easier filtering in admin
+    const urlLower = url.toLowerCase()
+    const platform = urlLower.includes('instagram.com') ? 'Instagram'
+      : urlLower.includes('tiktok.com')   ? 'TikTok'
+      : urlLower.includes('youtube.com') || urlLower.includes('youtu.be') ? 'YouTube'
+      : urlLower.includes('facebook.com') || urlLower.includes('fb.watch') ? 'Facebook'
+      : urlLower.includes('twitter.com') || urlLower.includes('x.com') ? 'X/Twitter'
+      : 'Other'
+
+    secLog('ERROR', 'DOWNLOAD_FAIL', {
+      ip:       dlIp,
+      platform,
+      url:      url.slice(0, 120),
+      format:   safeFormat,
+      quality:  safeQuality,
+      msg:      err.message.slice(0, 200),
+      stderr:   errorLine.slice(0, 300),
+      hint:     stderrRaw.length > 0
+        ? stderrRaw.slice(0, 500)
+        : undefined,
+    })
+
     fs.readdirSync(TMP_DIR).filter(f => f.startsWith(jobId)).forEach(f =>
       deleteFiles(path.join(TMP_DIR, f))
     )
